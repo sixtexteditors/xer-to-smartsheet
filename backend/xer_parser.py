@@ -148,7 +148,7 @@ def _parse_taskrsrc(rows, rsrc_map):
 
 def _format_date(date_str):
     if not date_str:
-        return ""
+        return None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             return datetime.strptime(date_str.strip(), fmt).strftime("%Y-%m-%d")

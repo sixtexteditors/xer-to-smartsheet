@@ -141,7 +141,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
             "Assigned To":  act.get("assigned_to", ""),
         }
         for col_name, value in fields.items():
-            if col_name in col_map and value not in (None, ""):
+            if col_name in col_map and value is not None:
                 cell = smartsheet.models.Cell()
                 cell.column_id = col_map[col_name]
                 cell.value = value
