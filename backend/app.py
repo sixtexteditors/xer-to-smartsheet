@@ -151,8 +151,9 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
     batch_size = 500
     for i in range(0, len(activities), batch_size):
         batch = activities[i:i + batch_size]
-        rows = [make_row(a) for a in batch]
-        ss.Sheets.add_rows(sheet_id, rows)
+        rows = [r for r in (make_row(a) for a in batch) if r.cells]
+        if rows:
+            ss.Sheets.add_rows(sheet_id, rows)
 
     # Return permalink
     sheet_info = ss.Sheets.get_sheet(sheet_id)
