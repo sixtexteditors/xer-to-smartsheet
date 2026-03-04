@@ -110,12 +110,14 @@ def _parse_tasks(rows, wbs_map):
         task_id_map[task_id] = i
         duration_hrs = float(row.get("target_drtn_hr_cnt", "0") or "0")
         duration_days = round(duration_hrs / 8, 1)
+        start_raw = row.get("target_start_date") or row.get("act_start_date", "")
+        finish_raw = row.get("target_end_date") or row.get("act_end_date", "")
         tasks.append({
             "_task_id": task_id,
             "task_name": row.get("task_name", ""),
             "wbs": wbs_map.get(row.get("wbs_id", ""), ""),
-            "start": _format_date(row.get("target_start_date", "")),
-            "finish": _format_date(row.get("target_end_date", "")),
+            "start": _format_date(start_raw),
+            "finish": _format_date(finish_raw),
             "duration": duration_days,
             "predecessors": "",
             "assigned_to": "",
