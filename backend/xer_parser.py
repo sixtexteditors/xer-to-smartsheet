@@ -149,7 +149,7 @@ def _format_date(date_str):
         return ""
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            return datetime.strptime(date_str.strip(), fmt).strftime("%m/%d/%Y")
+            return datetime.strptime(date_str.strip(), fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
     return date_str
