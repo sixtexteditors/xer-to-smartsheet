@@ -15,7 +15,7 @@ def parse_xer(file_content: str) -> dict:
     tables = _split_tables(file_content)
 
     project = _parse_project(tables.get("PROJECT", []))
-    wbs_map = _parse_wbs(tables.get("WBS", []))
+    wbs_map = _parse_wbs(tables.get("PROJWBS", tables.get("WBS", [])))
     rsrc_map = _parse_rsrc(tables.get("RSRC", []))
     tasks, task_id_map = _parse_tasks(tables.get("TASK", []), wbs_map)
     taskpred = _parse_taskpred(tables.get("TASKPRED", []))
@@ -90,7 +90,7 @@ def _parse_wbs(rows):
         if not node:
             return ""
         parent_id = node.get("parent_wbs_id", "")
-        short = node.get("wbs_short_name") or node.get("wbs_name", "")
+        short = node.get("wbs_short_name", node.get("wbs_name", ""))
         if parent_id and parent_id in wbs_by_id:
             parent_path = get_path(parent_id, visited)
             return f"{parent_path}.{short}" if parent_path else short
