@@ -174,15 +174,14 @@ def _enable_dependencies(ss, sheet_id: int, col_map: dict):
     Once enabled, the Predecessors column drives start date calculations:
     each task start date is set to the latest finish date of its predecessors.
     """
-    project_settings = smartsheet.models.ProjectSettings({
-        "workingDays": ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"],
-        "nonWorkingDays": [],
-        "lengthOfDay": 8,
-        "useWorkingDays": True,
-    })
     sheet_update = smartsheet.models.Sheet({
         "dependenciesEnabled": True,
-        "projectSettings": project_settings,
+        "projectSettings": {
+            "workingDays": ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"],
+            "nonWorkingDays": [],
+            "lengthOfDay": 8,
+            "useWorkingDays": True,
+        },
     })
     ss.Sheets.update_sheet(sheet_id, sheet_update)
 
