@@ -120,19 +120,25 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
         sheet = ss.Sheets.get_sheet(sheet_id)
         col_map = {c.title: c.id for c in sheet.columns}
 
+    # Enable Smartsheet dependency engine so predecessors drive start dates
+    _enable_dependencies(ss, sheet_id, col_map)
+
+
     # --- Build rows (batch in groups of 500) ---
     def make_row(act):
         row = smartsheet.models.Row()
         row.to_bottom = True
+        dur = act.get("duration", 0)
         fields = {
             "Task Name":    act.get("task_name", ""),
             "WBS":          act.get("wbs", ""),
             "Start":        act.get("start", ""),
             "Finish":       act.get("finish", ""),
-            "Duration":     str(act.get("duration", "")),
+            "Duration":     int(dur) if dur == int(dur) else dur,
             "Predecessors": act.get("predecessors", ""),
             "Assigned To":  act.get("assigned_to", ""),
         }
+
         for col_name, value in fields.items():
             if col_name in col_map:
                 cell = smartsheet.models.Cell()
@@ -151,6 +157,23 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
     sheet_info = ss.Sheets.get_sheet(sheet_id, row_numbers=None, column_ids=None)
     return sheet_info.permalink
 
+def _enable_dependencies(ss, sheet_id: int, col_map: dict):
+    """
+    Enable Smartsheet Gantt dependency engine.
+    Once enabled, the Predecessors column drives start date calculations:
+    each task start date is set to the latest finish date of its predecessors.
+    """
+    project_settings = smartsheet.models.ProjectSettings({
+        "workingDays": ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"],
+        "nonWorkingDays": [],
+        "lengthOfDay": 8,
+        "useWorkingDays": True,
+    })
+    sheet_update = smartsheet.models.Sheet({
+        "dependenciesEnabled": True,
+        "projectSettings": project_settings,
+    })
+    ss.Sheets.update_sheet(sheet_id, sheet_update)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
