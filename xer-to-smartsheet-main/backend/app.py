@@ -107,15 +107,8 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
             for i in range(0, len(row_ids), 450):
                 ss.Sheets.delete_rows(existing_id, row_ids[i:i + 450])
         sheet_id = existing_id
+        # Ensure columns match - get current col map
         col_map = {c.title: c.id for c in sheet.columns}
-        # Add any columns that exist in our definition but are missing from the sheet
-        for col_def in column_defs:
-            if col_def["title"] not in col_map and not col_def.get("primary"):
-                col_obj = smartsheet.models.Column(
-                    {"title": col_def["title"], "type": col_def["type"]}
-                )
-                added = ss.Sheets.add_columns(sheet_id, [col_obj])
-                col_map[col_def["title"]] = added.result[0].id
     else:
         # Create new sheet
         cols = [smartsheet.models.Column({"title": c["title"], "type": c["type"],
@@ -147,7 +140,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
         }
 
         for col_name, value in fields.items():
-            if col_name in col_map and value is not None:
+            if col_name in col_map:
                 cell = smartsheet.models.Cell()
                 cell.column_id = col_map[col_name]
                 cell.value = value
@@ -157,12 +150,11 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
     batch_size = 500
     for i in range(0, len(activities), batch_size):
         batch = activities[i:i + batch_size]
-        rows = [r for r in (make_row(a) for a in batch) if r.cells]
-        if rows:
-            ss.Sheets.add_rows(sheet_id, rows)
+        rows = [make_row(a) for a in batch]
+        ss.Sheets.add_rows(sheet_id, rows)
 
     # Return permalink
-    sheet_info = ss.Sheets.get_sheet(sheet_id)
+    sheet_info = ss.Sheets.get_sheet(sheet_id, row_numbers=None, column_ids=None)
     return sheet_info.permalink
 
 def _enable_dependencies(ss, sheet_id: int, col_map: dict):
