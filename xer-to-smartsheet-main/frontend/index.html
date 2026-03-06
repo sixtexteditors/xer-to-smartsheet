@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>XER → Smartsheet</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: #f5f7fa; color: #1a1a2e; min-height: 100vh; }
+    .container { max-width: 600px; margin: 60px auto; padding: 0 20px; }
+    .card { background: white; border-radius: 12px; padding: 40px;
+            box-shadow: 0 2px 20px rgba(0,0,0,0.08); }
+    .logo { display: flex; align-items: center; gap: 12px; margin-bottom: 32px; }
+    .logo-icon { width: 40px; height: 40px; background: #0A6640;
+                 border-radius: 8px; display: flex; align-items: center;
+                 justify-content: center; color: white; font-size: 20px; }
+    h1 { font-size: 22px; font-weight: 700; color: #1a1a2e; }
+    .subtitle { color: #666; font-size: 14px; margin-top: 2px; }
+    .field { margin-bottom: 20px; }
+    label { display: block; font-size: 13px; font-weight: 600;
+            color: #444; margin-bottom: 6px; }
+    input[type="text"], input[type="password"] {
+      width: 100%; padding: 10px 14px; border: 1.5px solid #ddd;
+      border-radius: 8px; font-size: 14px; transition: border 0.2s;
+      outline: none; }
+    input:focus { border-color: #0A6640; }
+    .drop-zone { border: 2px dashed #ccc; border-radius: 10px; padding: 36px;
+                 text-align: center; cursor: pointer; transition: all 0.2s;
+                 background: #fafafa; }
+    .drop-zone.over { border-color: #0A6640; background: #f0faf5; }
+    .drop-zone.has-file { border-color: #0A6640; background: #f0faf5; }
+    .drop-text { color: #888; font-size: 14px; }
+    .file-name { color: #0A6640; font-weight: 600; font-size: 14px; }
+    .btn { width: 100%; padding: 13px; background: #0A6640; color: white;
+           border: none; border-radius: 8px; font-size: 15px; font-weight: 600;
+           cursor: pointer; transition: background 0.2s; margin-top: 8px; }
+    .btn:hover:not(:disabled) { background: #085230; }
+    .btn:disabled { background: #aaa; cursor: not-allowed; }
+    .status { margin-top: 20px; padding: 14px 18px; border-radius: 8px;
+              font-size: 14px; }
+    .status.loading { background: #fffbea; color: #7a5c00; border: 1px solid #ffe58f; }
+    .status.success { background: #f0faf5; color: #0A6640; border: 1px solid #b7ebd0; }
+    .status.error   { background: #fff2f0; color: #c0392b; border: 1px solid #ffc9c4; }
+    .link { color: #0A6640; font-weight: 600; word-break: break-all; }
+    .hint { font-size: 12px; color: #999; margin-top: 4px; }
+    .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #ffe58f;
+               border-top-color: #7a5c00; border-radius: 50%; animation: spin 0.7s linear infinite;
+               margin-right: 8px; vertical-align: middle; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef } = React;
+
+function App() {
+  const [apiKey, setApiKey]       = useState("");
+  const [sheetName, setSheetName] = useState("");
+  const [file, setFile]           = useState(null);
+  const [dragging, setDragging]   = useState(false);
+  const [status, setStatus]       = useState(null); // {type, message, url?}
+  const [loading, setLoading]     = useState(false);
+  const inputRef = useRef();
+
+  const handleDrop = (e) => {
+    e.preventDefault(); setDragging(false);
+    const f = e.dataTransfer.files[0];
+    if (f && f.name.toLowerCase().endsWith(".xer")) setFile(f);
+    else setStatus({type:"error", message:"Please drop a .xer file."});
+  };
+
+  const handleFileInput = (e) => {
+    const f = e.target.files[0];
+    if (f) setFile(f);
+  };
+
+  const handleSubmit = async () => {
+    if (!apiKey) return setStatus({type:"error", message:"Please enter your Smartsheet API key."});
+    if (!file)   return setStatus({type:"error", message:"Please select an XER file."});
+    setLoading(true); setStatus({type:"loading", message:"Parsing XER and pushing to Smartsheet..."});
+
+    const form = new FormData();
+    form.append("file", file);
+    if (sheetName) form.append("sheet_name", sheetName);
+
+    try {
+      const res = await fetch("/api/import", {
+        method: "POST",
+        headers: { "X-Smartsheet-Token": apiKey },
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus({type:"error", message: data.error || "Unknown error occurred."});
+      } else {
+        setStatus({
+          type: "success",
+          message: `✓ Imported ${data.activity_count} activities into "${data.sheet_name}"`,
+          url: data.sheet_url,
+        });
+      }
+    } catch (err) {
+      setStatus({type:"error", message:"Network error. Is the server running?"});
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="container">
+      <div className="card">
+        <div className="logo">
+          <div className="logo-icon">📋</div>
+          <div>
+            <h1>XER → Smartsheet</h1>
+            <div className="subtitle">Import Primavera P6 schedules with dependencies</div>
+          </div>
+        </div>
+
+        <div className="field">
+          <label>Smartsheet API Key</label>
+          <input type="password" placeholder="Paste your Smartsheet API key"
+            value={apiKey} onChange={e => setApiKey(e.target.value)} />
+          <div className="hint">Found in Smartsheet → Account → Personal Settings → API Access</div>
+        </div>
+
+        <div className="field">
+          <label>Sheet Name <span style={{fontWeight:400,color:"#aaa"}}>(optional — defaults to project name)</span></label>
+          <input type="text" placeholder="e.g. Cape Project Schedule"
+            value={sheetName} onChange={e => setSheetName(e.target.value)} />
+        </div>
+
+        <div className="field">
+          <label>XER File</label>
+          <div className={`drop-zone ${dragging ? "over" : ""} ${file ? "has-file" : ""}`}
+            onClick={() => inputRef.current.click()}
+            onDragOver={e => { e.preventDefault(); setDragging(true); }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={handleDrop}>
+            {file
+              ? <div className="file-name">📄 {file.name}</div>
+              : <div className="drop-text">Drop .xer file here or click to browse</div>}
+          </div>
+          <input ref={inputRef} type="file" accept=".xer"
+            style={{display:"none"}} onChange={handleFileInput} />
+        </div>
+
+        <button className="btn" disabled={loading || !apiKey || !file} onClick={handleSubmit}>
+          {loading ? "Importing..." : "Import to Smartsheet"}
+        </button>
+
+        {status && (
+          <div className={`status ${status.type}`}>
+            {status.type === "loading" && <span className="spinner"/>}
+            {status.message}
+            {status.url && (
+              <div style={{marginTop:8}}>
+                <a className="link" href={status.url} target="_blank" rel="noreferrer">
+                  Open in Smartsheet →
+                </a>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
