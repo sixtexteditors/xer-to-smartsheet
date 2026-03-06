@@ -121,7 +121,10 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
         col_map = {c.title: c.id for c in sheet.columns}
 
     # Enable Smartsheet dependency engine so predecessors drive start dates
-    # _enable_dependencies(ss, sheet_id, col_map)
+  try:
+      _enable_dependencies(ss, sheet_id, col_map)
+  except Exception as e:
+        return jsonify({"dependency error": f"Smartsheet error: {str(e)}"}), 500
 
 
     # --- Build rows (batch in groups of 500) ---
