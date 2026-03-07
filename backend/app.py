@@ -89,15 +89,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
             existing_id = s.id
             break
 
-    column_defs = [
-        {"title": "Task Name",    "type": "TEXT_NUMBER", "primary": True},
-        {"title": "WBS",          "type": "TEXT_NUMBER"},
-        {"title": "Start",        "type": "DATE"},
-        {"title": "Finish",       "type": "DATE"},
-        {"title": "Duration",     "type": "TEXT_NUMBER"},
-        {"title": "Predecessors", "type": "TEXT_NUMBER"},
-        {"title": "Assigned To",  "type": "TEXT_NUMBER"},
-    ]
+    TEMPLATE_ID = 3909668863692676
 
     if existing_id:
         # Delete all existing rows to reset the sheet (batch max 450 per API call)
@@ -107,25 +99,14 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
             for i in range(0, len(row_ids), 450):
                 ss.Sheets.delete_rows(existing_id, row_ids[i:i + 450])
         sheet_id = existing_id
-        # Ensure columns match - get current col map
         col_map = {c.title: c.id for c in sheet.columns}
     else:
-        # Create new sheet
-        cols = [smartsheet.models.Column({"title": c["title"], "type": c["type"],
-                                          "primary": c.get("primary", False)})
-                for c in column_defs]
-        new_sheet = smartsheet.models.Sheet({"name": sheet_name, "columns": cols})
-        result = ss.Home.create_sheet(new_sheet)
+        # Create new sheet from template (template has dependencies already enabled)
+        new_sheet = smartsheet.models.Sheet({"name": sheet_name, "from_id": TEMPLATE_ID})
+        result = ss.Home.create_sheet_from_template(new_sheet)
         sheet_id = result.result.id
         sheet = ss.Sheets.get_sheet(sheet_id)
         col_map = {c.title: c.id for c in sheet.columns}
-
-    # Enable Smartsheet dependency engine so predecessors drive start dates
-     try:
-        _enable_dependencies(ss, sheet_id, col_map)
-    except Exception as dep_err:
-        print(f"Warning: could not enable dependencies: {dep_err}"
-
 
     # --- Build rows (batch in groups of 500) ---
     def make_row(act):
@@ -159,24 +140,6 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
     # Return permalink
     sheet_info = ss.Sheets.get_sheet(sheet_id, row_numbers=None, column_ids=None)
     return sheet_info.permalink
-
-def _enable_dependencies(ss, sheet_id: int, col_map: dict):
-    """
-    Enable Smartsheet Gantt dependency engine.
-    Once enabled, the Predecessors column drives start date calculations:
-    each task start date is set to the latest finish date of its predecessors.
-    """
-    project_settings = smartsheet.models.ProjectSettings({
-        "workingDays": ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"],
-        "nonWorkingDays": [],
-        "lengthOfDay": 8,
-        "useWorkingDays": True,
-    })
-    sheet_update = smartsheet.models.Sheet({
-        "dependenciesEnabled": True,
-        "projectSettings": project_settings,
-    })
-    ss.Sheets.update_sheet(sheet_id, sheet_update)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

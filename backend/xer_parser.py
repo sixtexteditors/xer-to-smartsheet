@@ -15,7 +15,7 @@ def parse_xer(file_content: str) -> dict:
     tables = _split_tables(file_content)
 
     project = _parse_project(tables.get("PROJECT", []))
-    wbs_map = _parse_wbs(tables.get("WBS", []))
+    wbs_map = _parse_wbs(tables.get("PROJWBS", tables.get("WBS", [])))
     rsrc_map = _parse_rsrc(tables.get("RSRC", []))
     tasks, task_id_map = _parse_tasks(tables.get("TASK", []), wbs_map)
     taskpred = _parse_taskpred(tables.get("TASKPRED", []))
@@ -110,12 +110,14 @@ def _parse_tasks(rows, wbs_map):
         task_id_map[task_id] = i
         duration_hrs = float(row.get("target_drtn_hr_cnt", "0") or "0")
         duration_days = round(duration_hrs / 8, 1)
+        start_raw = row.get("target_start_date") or row.get("act_start_date", "")
+        finish_raw = row.get("target_end_date") or row.get("act_end_date", "")
         tasks.append({
             "_task_id": task_id,
             "task_name": row.get("task_name", ""),
             "wbs": wbs_map.get(row.get("wbs_id", ""), ""),
-            "start": _format_date(row.get("target_start_date", "")),
-            "finish": _format_date(row.get("target_end_date", "")),
+            "start": _format_date(start_raw),
+            "finish": _format_date(finish_raw),
             "duration": duration_days,
             "predecessors": "",
             "assigned_to": "",
@@ -146,10 +148,10 @@ def _parse_taskrsrc(rows, rsrc_map):
 
 def _format_date(date_str):
     if not date_str:
-        return ""
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            return datetime.strptime(date_str.strip(), fmt).strftime("%m/%d/%Y")
+            return datetime.strptime(date_str.strip(), fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
     return date_str
