@@ -6,6 +6,7 @@ Endpoints:
 """
 
 import os
+import requests
 import smartsheet
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -101,10 +102,14 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
         sheet_id = existing_id
         col_map = {c.title: c.id for c in sheet.columns}
     else:
-        # Create new sheet from template (template has dependencies already enabled)
-        new_sheet = smartsheet.models.Sheet({"name": sheet_name, "from_id": TEMPLATE_ID})
-        result = ss.Home.create_sheet_from_template(new_sheet)
-        sheet_id = result.result.id
+        # Create new sheet from template via direct API call (dependencies already enabled in template)
+        resp = requests.post(
+            "https://api.smartsheet.com/2.0/sheets",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"name": sheet_name, "fromId": TEMPLATE_ID},
+        )
+        resp.raise_for_status()
+        sheet_id = resp.json()["result"]["id"]
         sheet = ss.Sheets.get_sheet(sheet_id)
         col_map = {c.title: c.id for c in sheet.columns}
 
