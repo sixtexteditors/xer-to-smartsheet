@@ -103,7 +103,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
     else:
         # Create new sheet from template (template has dependencies already enabled)
         new_sheet = smartsheet.models.Sheet({"name": sheet_name, "from_id": TEMPLATE_ID})
-        result = ss.Sheets.create_sheet_from_template(new_sheet)
+        result = ss.Home.create_sheet_from_template(new_sheet)
         sheet_id = result.result.id
         sheet = ss.Sheets.get_sheet(sheet_id)
         col_map = {c.title: c.id for c in sheet.columns}
