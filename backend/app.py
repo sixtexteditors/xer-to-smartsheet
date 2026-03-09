@@ -103,18 +103,15 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
         col_map = {c.title: c.id for c in sheet.columns}
     else:
         # Create new sheet from template via direct API call (dependencies already enabled in template)
-        print(f"DEBUG: POSTing to Smartsheet to create sheet '{sheet_name}' from template {TEMPLATE_ID}")
         resp = requests.post(
             "https://api.smartsheet.com/2.0/sheets",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={"name": sheet_name, "fromId": TEMPLATE_ID},
         )
-        print(f"DEBUG: POST status={resp.status_code}, body={resp.text[:500]}")
-        resp.raise_for_status()
+        if not resp.ok:
+            raise Exception(f"Sheet creation failed (HTTP {resp.status_code}): {resp.text}")
         sheet_id = resp.json()["result"]["id"]
-        print(f"DEBUG: Sheet created, id={sheet_id}")
         sheet = ss.Sheets.get_sheet(sheet_id)
-        print(f"DEBUG: get_sheet OK, columns={[c.title for c in sheet.columns]}")
         col_map = {c.title: c.id for c in sheet.columns}
 
     # --- Build rows (batch in groups of 500) ---
@@ -144,9 +141,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
     for i in range(0, len(activities), batch_size):
         batch = activities[i:i + batch_size]
         rows = [make_row(a) for a in batch]
-        print(f"DEBUG: Adding rows {i} to {i + len(batch)}")
         ss.Sheets.add_rows(sheet_id, rows)
-        print(f"DEBUG: add_rows OK for batch {i}")
 
     # Return permalink
     sheet_info = ss.Sheets.get_sheet(sheet_id, row_numbers=None, column_ids=None)
