@@ -9,7 +9,7 @@ import os
 import smartsheet
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from xer_parser import parse_xer
+from xer_parser import parse_xer, _lag_to_days, _normalize_rel_type
 
 # In Docker, frontend is at /app/frontend (sibling of this file).
 # In local dev (running from backend/), frontend is at ../frontend.
@@ -55,31 +55,38 @@ def import_xer():
         return jsonify({"error": f"XER parse error: {str(e)}"}), 422
 
     project_name = request.form.get("sheet_name", "").strip() or parsed["project_name"]
-    activities = parsed["activities"]
+    activities_flat = parsed["activities_flat"]
 
-    if not activities:
+    if not activities_flat:
         return jsonify({"error": "No activities found in XER file"}), 422
 
     try:
-        sheet_url = _push_to_smartsheet(api_key, project_name, activities)
+        sheet_url = _push_to_smartsheet(api_key, project_name, parsed)
     except Exception as e:
         return jsonify({"error": f"Smartsheet error: {str(e)}"}), 500
 
     return jsonify({
         "success": True,
         "sheet_name": project_name,
-        "activity_count": len(activities),
+        "activity_count": len(activities_flat),
         "sheet_url": sheet_url,
     })
 
 
-def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
+def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
     """
-    Create or overwrite a Smartsheet with activities.
+    Create or overwrite a Smartsheet with WBS hierarchy and activities.
+    Uses a two-pass approach: insert all rows first, then update predecessor
+    cells with correct Smartsheet row numbers.
     Returns the permalink URL of the sheet.
     """
     ss = smartsheet.Smartsheet(api_key)
     ss.errors_as_exceptions(True)
+
+    wbs_tree = parsed["wbs_tree"]
+    activities_by_wbs = parsed["activities_by_wbs"]
+    activities_flat = parsed["activities_flat"]
+    predecessor_map = parsed["predecessor_map"]
 
     # --- Find or create sheet ---
     existing_id = None
@@ -91,7 +98,6 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
 
     column_defs = [
         {"title": "Task Name",    "type": "TEXT_NUMBER", "primary": True},
-        {"title": "WBS",          "type": "TEXT_NUMBER"},
         {"title": "Start",        "type": "DATE"},
         {"title": "Finish",       "type": "DATE"},
         {"title": "Duration",     "type": "TEXT_NUMBER"},
@@ -127,37 +133,125 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, activities: list) -> str:
         sheet = ss.Sheets.get_sheet(sheet_id)
         col_map = {c.title: c.id for c in sheet.columns}
 
-    # --- Build rows (batch in groups of 500) ---
-    def make_row(act):
-        row = smartsheet.models.Row()
-        row.to_bottom = True
-        fields = {
-            "Task Name":    act.get("task_name", ""),
-            "WBS":          act.get("wbs", ""),
-            "Start":        act.get("start", ""),
-            "Finish":       act.get("finish", ""),
-            "Duration":     str(act.get("duration", "")),
-            "Predecessors": act.get("predecessors", ""),
-            "Assigned To":  act.get("assigned_to", ""),
-        }
-        for col_name, value in fields.items():
-            if col_name in col_map and value is not None:
-                cell = smartsheet.models.Cell()
-                cell.column_id = col_map[col_name]
-                cell.value = value
-                row.cells.append(cell)
-        return row
+    _enable_dependencies(ss, sheet_id)
+
+    # --- PASS 1: Insert rows with WBS hierarchy ---
+    wbs_id_to_ss_row_id = {}   # wbs_id -> Smartsheet row ID
+    task_id_to_ss_row_id = {}  # XER task_id -> Smartsheet row ID
+
+    def make_cell(col_name, value):
+        cell = smartsheet.models.Cell()
+        cell.column_id = col_map[col_name]
+        cell.value = value
+        return cell
+
+    for node in wbs_tree:
+        wbs_id = node["wbs_id"]
+        wbs_name = node["wbs_name"]
+        parent_wbs_id = node["parent_wbs_id"]
+
+        # Insert summary row for this WBS node
+        wbs_row = smartsheet.models.Row()
+        wbs_row.to_bottom = True
+        if parent_wbs_id and parent_wbs_id in wbs_id_to_ss_row_id:
+            wbs_row.parent_id = wbs_id_to_ss_row_id[parent_wbs_id]
+        wbs_row.cells = [make_cell("Task Name", wbs_name)]
+        result = ss.Sheets.add_rows(sheet_id, [wbs_row])
+        wbs_ss_row_id = result.result[0].id
+        wbs_id_to_ss_row_id[wbs_id] = wbs_ss_row_id
+
+        # Insert activity rows as children of this WBS node
+        node_activities = activities_by_wbs.get(wbs_id, [])
+        batch_size = 500
+        for i in range(0, len(node_activities), batch_size):
+            batch = node_activities[i:i + batch_size]
+            rows = []
+            for act in batch:
+                row = smartsheet.models.Row()
+                row.to_bottom = True
+                row.parent_id = wbs_ss_row_id
+                cells = [make_cell("Task Name", act.get("task_name", ""))]
+                if act.get("start"):
+                    cells.append(make_cell("Start", act["start"]))
+                if act.get("finish"):
+                    cells.append(make_cell("Finish", act["finish"]))
+                cells.append(make_cell("Duration", str(act.get("duration", ""))))
+                if act.get("assigned_to"):
+                    cells.append(make_cell("Assigned To", act["assigned_to"]))
+                row.cells = cells
+                rows.append(row)
+            if rows:
+                result = ss.Sheets.add_rows(sheet_id, rows)
+                for act, returned_row in zip(batch, result.result):
+                    task_id_to_ss_row_id[act["_task_id"]] = returned_row.id
+
+    # --- PASS 2: Update predecessors with actual Smartsheet row numbers ---
+    sheet_data = ss.Sheets.get_sheet(sheet_id)
+    ss_row_id_to_row_number = {r.id: r.row_number for r in sheet_data.rows}
+
+    update_rows = []
+    for act in activities_flat:
+        tid = act["_task_id"]
+        preds = predecessor_map.get(tid, [])
+        if not preds:
+            continue
+
+        pred_parts = []
+        for p in preds:
+            pred_tid = p["pred_task_id"]
+            pred_ss_row_id = task_id_to_ss_row_id.get(pred_tid)
+            if pred_ss_row_id is None:
+                continue
+            row_number = ss_row_id_to_row_number.get(pred_ss_row_id)
+            if row_number is None:
+                continue
+            lag_days = _lag_to_days(p.get("lag_hr_cnt", "0"))
+            rel_type = _normalize_rel_type(p.get("pred_type", "PR_FS"))
+            if lag_days != 0:
+                sign = "+" if lag_days > 0 else ""
+                pred_parts.append(f"{row_number}{rel_type}{sign}{lag_days}d")
+            elif rel_type != "FS":
+                pred_parts.append(f"{row_number}{rel_type}")
+            else:
+                pred_parts.append(str(row_number))
+
+        if not pred_parts:
+            continue
+
+        act_ss_row_id = task_id_to_ss_row_id.get(tid)
+        if act_ss_row_id is None:
+            continue
+
+        update_row = smartsheet.models.Row()
+        update_row.id = act_ss_row_id
+        cell = smartsheet.models.Cell()
+        cell.column_id = col_map["Predecessors"]
+        cell.value = ",".join(pred_parts)
+        update_row.cells = [cell]
+        update_rows.append(update_row)
 
     batch_size = 500
-    for i in range(0, len(activities), batch_size):
-        batch = activities[i:i + batch_size]
-        rows = [r for r in (make_row(a) for a in batch) if r.cells]
-        if rows:
-            ss.Sheets.add_rows(sheet_id, rows)
+    for i in range(0, len(update_rows), batch_size):
+        ss.Sheets.update_rows(sheet_id, update_rows[i:i + batch_size])
 
     # Return permalink
     sheet_info = ss.Sheets.get_sheet(sheet_id)
     return sheet_info.permalink
+
+
+def _enable_dependencies(ss, sheet_id):
+    """Enable dependency settings on the sheet so Smartsheet recognizes predecessor links."""
+    project_settings = smartsheet.models.ProjectSettings({
+        "working_days_in_week": 5,
+        "non_working_day_list": [],
+        "length_of_day": 8,
+    })
+    ss.Sheets.update_sheet(
+        sheet_id,
+        smartsheet.models.Sheet({
+            "project_settings": project_settings,
+        }),
+    )
 
 
 if __name__ == "__main__":

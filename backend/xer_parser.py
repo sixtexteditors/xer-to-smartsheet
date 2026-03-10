@@ -10,46 +10,82 @@ from datetime import datetime
 def parse_xer(file_content: str) -> dict:
     """
     Parse a P6 XER file and return structured data ready for Smartsheet import.
-    Returns a dict with keys: project_name, activities (list of dicts)
+    Returns a dict with keys:
+      - project_name: str
+      - wbs_tree: ordered list of WBS node dicts (depth-first), each with
+                  {wbs_id, wbs_name, parent_wbs_id, depth}
+      - activities_by_wbs: dict mapping wbs_id -> list of activity dicts
+      - activities_flat: all activities in XER order (each has _task_id, _wbs_id)
+      - predecessor_map: dict mapping task_id -> list of predecessor info dicts
+      - task_id_map: dict mapping task_id -> 1-based XER order index (for debugging)
     """
     tables = _split_tables(file_content)
 
     project = _parse_project(tables.get("PROJECT", []))
-    wbs_map = _parse_wbs(tables.get("PROJWBS", tables.get("WBS", [])))
+    wbs_rows = tables.get("PROJWBS", tables.get("WBS", []))
+    wbs_tree = _build_wbs_tree(wbs_rows)
     rsrc_map = _parse_rsrc(tables.get("RSRC", []))
-    tasks, task_id_map = _parse_tasks(tables.get("TASK", []), wbs_map)
+    tasks, task_id_map = _parse_tasks(tables.get("TASK", []))
     taskpred = _parse_taskpred(tables.get("TASKPRED", []))
     taskrsrc = _parse_taskrsrc(tables.get("TASKRSRC", []), rsrc_map)
-
-    for task in tasks:
-        tid = task["_task_id"]
-        preds = taskpred.get(tid, [])
-        pred_strings = []
-        for p in preds:
-            pred_row_num = task_id_map.get(p["pred_task_id"])
-            if pred_row_num is not None:
-                lag_days = _lag_to_days(p.get("lag_hr_cnt", "0"))
-                rel_type = _normalize_rel_type(p.get("pred_type", "PR_FS"))
-                if lag_days != 0:
-                    sign = "+" if lag_days > 0 else ""
-                    pred_strings.append(f"{pred_row_num}{rel_type}{sign}{lag_days}d")
-                else:
-                    pred_strings.append(f"{pred_row_num}{rel_type}")
-        task["predecessors"] = ",".join(pred_strings)
-
 
     for task in tasks:
         tid = task["_task_id"]
         resources = taskrsrc.get(tid, [])
         task["assigned_to"] = ", ".join(resources) if resources else ""
 
+    activities_by_wbs = defaultdict(list)
     for task in tasks:
-        task.pop("_task_id", None)
+        activities_by_wbs[task["_wbs_id"]].append(task)
 
     return {
         "project_name": project.get("proj_short_name", "Imported Project"),
-        "activities": tasks,
+        "wbs_tree": wbs_tree,
+        "activities_by_wbs": dict(activities_by_wbs),
+        "activities_flat": tasks,
+        "predecessor_map": dict(taskpred),
+        "task_id_map": task_id_map,
     }
+
+
+def _build_wbs_tree(rows):
+    """
+    Build an ordered list of WBS nodes in depth-first order.
+    Each node dict: {wbs_id, wbs_name, parent_wbs_id, depth}
+    Root nodes are those whose parent_wbs_id is absent or not in the table.
+    """
+    if not rows:
+        return []
+
+    wbs_by_id = {r["wbs_id"]: r for r in rows}
+    children_map = defaultdict(list)
+    roots = []
+
+    for wbs_id, node in wbs_by_id.items():
+        parent_id = node.get("parent_wbs_id", "")
+        if parent_id and parent_id in wbs_by_id:
+            children_map[parent_id].append(wbs_id)
+        else:
+            roots.append(wbs_id)
+
+    result = []
+
+    def recurse(wbs_id, depth):
+        node = wbs_by_id[wbs_id]
+        parent_id = node.get("parent_wbs_id", "")
+        result.append({
+            "wbs_id": wbs_id,
+            "wbs_name": node.get("wbs_short_name", node.get("wbs_name", "")),
+            "parent_wbs_id": parent_id if parent_id in wbs_by_id else "",
+            "depth": depth,
+        })
+        for child_id in children_map.get(wbs_id, []):
+            recurse(child_id, depth + 1)
+
+    for root_id in roots:
+        recurse(root_id, 0)
+
+    return result
 
 
 def _split_tables(content: str) -> dict:
@@ -78,31 +114,11 @@ def _parse_project(rows):
     return rows[0] if rows else {}
 
 
-def _parse_wbs(rows):
-    wbs_by_id = {r["wbs_id"]: r for r in rows}
-    def get_path(wbs_id, visited=None):
-        if visited is None:
-            visited = set()
-        if wbs_id in visited:
-            return ""  # Break cycle
-        visited.add(wbs_id)
-        node = wbs_by_id.get(wbs_id)
-        if not node:
-            return ""
-        parent_id = node.get("parent_wbs_id", "")
-        short = node.get("wbs_short_name", node.get("wbs_name", ""))
-        if parent_id and parent_id in wbs_by_id:
-            parent_path = get_path(parent_id, visited)
-            return f"{parent_path}.{short}" if parent_path else short
-        return short
-    return {wid: get_path(wid) for wid in wbs_by_id}
-
-
 def _parse_rsrc(rows):
     return {r["rsrc_id"]: r.get("rsrc_name", r.get("rsrc_short_name", "")) for r in rows}
 
 
-def _parse_tasks(rows, wbs_map):
+def _parse_tasks(rows):
     tasks = []
     task_id_map = {}
     for i, row in enumerate(rows, start=1):
@@ -114,12 +130,11 @@ def _parse_tasks(rows, wbs_map):
         finish_raw = row.get("target_end_date") or row.get("act_end_date", "")
         tasks.append({
             "_task_id": task_id,
+            "_wbs_id": row.get("wbs_id", ""),
             "task_name": row.get("task_name", ""),
-            "wbs": wbs_map.get(row.get("wbs_id", ""), ""),
             "start": _format_date(start_raw),
             "finish": _format_date(finish_raw),
             "duration": duration_days,
-            "predecessors": "",
             "assigned_to": "",
         })
     return tasks, task_id_map

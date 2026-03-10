@@ -82,7 +82,7 @@ function App() {
   const handleSubmit = async () => {
     if (!apiKey) return setStatus({type:"error", message:"Please enter your Smartsheet API key."});
     if (!file)   return setStatus({type:"error", message:"Please select an XER file."});
-    setLoading(true); setStatus({type:"loading", message:"Parsing XER and pushing to Smartsheet..."});
+    setLoading(true); setStatus({type:"loading", message:"Parsing XER and building WBS hierarchy in Smartsheet… (large schedules may take a moment)"});
 
     const form = new FormData();
     form.append("file", file);
@@ -100,7 +100,7 @@ function App() {
       } else {
         setStatus({
           type: "success",
-          message: `✓ Imported ${data.activity_count} activities into "${data.sheet_name}"`,
+          message: `✓ Imported ${data.activity_count} activities with WBS hierarchy into "${data.sheet_name}"`,
           url: data.sheet_url,
         });
       }
@@ -118,7 +118,7 @@ function App() {
           <div className="logo-icon">📋</div>
           <div>
             <h1>XER → Smartsheet</h1>
-            <div className="subtitle">Import Primavera P6 schedules with dependencies</div>
+            <div className="subtitle">Import Primavera P6 schedules with WBS hierarchy and dependencies</div>
           </div>
         </div>
 
