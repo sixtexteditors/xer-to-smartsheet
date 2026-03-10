@@ -106,12 +106,13 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
     ]
 
     if existing_id:
-        # Delete all existing rows to reset the sheet (batch max 450 per API call)
+        # Delete only root-level rows — Smartsheet cascades to children automatically.
+        # Passing child row IDs after their parent is already deleted causes API errors.
         sheet = ss.Sheets.get_sheet(existing_id)
         if sheet.rows:
-            row_ids = [r.id for r in sheet.rows]
-            for i in range(0, len(row_ids), 450):
-                ss.Sheets.delete_rows(existing_id, row_ids[i:i + 450])
+            root_ids = [r.id for r in sheet.rows if not getattr(r, "parent_id", None)]
+            for i in range(0, len(root_ids), 450):
+                ss.Sheets.delete_rows(existing_id, root_ids[i:i + 450])
         sheet_id = existing_id
         col_map = {c.title: c.id for c in sheet.columns}
         # Add any columns that exist in our definition but are missing from the sheet
@@ -185,6 +186,34 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
                 for act, returned_row in zip(batch, result.result):
                     task_id_to_ss_row_id[act["_task_id"]] = returned_row.id
 
+    # Fallback: insert activities whose WBS ID never appeared in wbs_tree
+    # (e.g. XER TASK rows referencing a WBS code not present in PROJWBS).
+    # Without this they would be silently lost.
+    visited_wbs_ids = {node["wbs_id"] for node in wbs_tree}
+    for orphan_wbs_id, orphan_activities in activities_by_wbs.items():
+        if orphan_wbs_id in visited_wbs_ids:
+            continue
+        for i in range(0, len(orphan_activities), batch_size):
+            batch = orphan_activities[i:i + batch_size]
+            rows = []
+            for act in batch:
+                row = smartsheet.models.Row()
+                row.to_bottom = True
+                cells = [make_cell("Task Name", act.get("task_name", ""))]
+                if act.get("start"):
+                    cells.append(make_cell("Start", act["start"]))
+                if act.get("finish"):
+                    cells.append(make_cell("Finish", act["finish"]))
+                cells.append(make_cell("Duration", str(act.get("duration", ""))))
+                if act.get("assigned_to"):
+                    cells.append(make_cell("Assigned To", act["assigned_to"]))
+                row.cells = cells
+                rows.append(row)
+            if rows:
+                result = ss.Sheets.add_rows(sheet_id, rows)
+                for act, returned_row in zip(batch, result.result):
+                    task_id_to_ss_row_id[act["_task_id"]] = returned_row.id
+
     # --- PASS 2: Update predecessors with actual Smartsheet row numbers ---
     sheet_data = ss.Sheets.get_sheet(sheet_id)
     ss_row_id_to_row_number = {r.id: r.row_number for r in sheet_data.rows}
@@ -234,9 +263,8 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
     for i in range(0, len(update_rows), batch_size):
         ss.Sheets.update_rows(sheet_id, update_rows[i:i + batch_size])
 
-    # Return permalink
-    sheet_info = ss.Sheets.get_sheet(sheet_id)
-    return sheet_info.permalink
+    # sheet_data was fetched at the start of Pass 2 and already has permalink
+    return sheet_data.permalink
 
 
 def _enable_dependencies(ss, sheet_id):
