@@ -6,8 +6,10 @@ Endpoints:
 """
 
 import os
+import traceback
 from collections import defaultdict
 import smartsheet
+import smartsheet.exceptions
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from xer_parser import parse_xer, _lag_to_days, _normalize_rel_type
@@ -63,8 +65,11 @@ def import_xer():
 
     try:
         sheet_url = _push_to_smartsheet(api_key, project_name, parsed)
+    except smartsheet.exceptions.ApiError as e:
+        err = e.error.result if hasattr(e, "error") and hasattr(e.error, "result") else str(e)
+        return jsonify({"error": err}), 500
     except Exception as e:
-        return jsonify({"error": f"Smartsheet error: {str(e)}"}), 500
+        return jsonify({"error": str(e), "detail": traceback.format_exc()}), 500
 
     return jsonify({
         "success": True,
@@ -123,7 +128,8 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
                     {"title": col_def["title"], "type": col_def["type"]}
                 )
                 added = ss.Sheets.add_columns(sheet_id, [col_obj])
-                col_map[col_def["title"]] = added.result[0].id
+                added_cols = added.result if isinstance(added.result, list) else [added.result]
+                col_map[col_def["title"]] = added_cols[0].id
     else:
         # Create new sheet
         cols = [smartsheet.models.Column({"title": c["title"], "type": c["type"],
@@ -191,7 +197,8 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
                     wbs_row.cells = [make_cell("Task Name", node["wbs_name"])]
                     rows.append((node["wbs_id"], wbs_row))
                 result = ss.Sheets.add_rows(sheet_id, [r for _, r in rows])
-                for (wbs_id, _), returned_row in zip(rows, result.result):
+                returned = result.result if isinstance(result.result, list) else [result.result]
+                for (wbs_id, _), returned_row in zip(rows, returned):
                     wbs_id_to_ss_row_id[wbs_id] = returned_row.id
 
     # Activities: group by WBS parent so each batch shares the same parent_id.
@@ -204,12 +211,13 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
             batch = acts[i:i + batch_size]
             rows = [(act["_task_id"], _build_activity_row(act, parent_ss_id)) for act in batch]
             result = ss.Sheets.add_rows(sheet_id, [r for _, r in rows])
-            for (task_id, _), returned_row in zip(rows, result.result):
+            returned = result.result if isinstance(result.result, list) else [result.result]
+            for (task_id, _), returned_row in zip(rows, returned):
                 task_id_to_ss_row_id[task_id] = returned_row.id
 
     # --- PASS 2: Update predecessors with actual Smartsheet row numbers ---
     sheet_data = ss.Sheets.get_sheet(sheet_id)
-    ss_row_id_to_row_number = {r.id: r.row_number for r in sheet_data.rows}
+    ss_row_id_to_row_number = {r.id: r.row_number for r in (sheet_data.rows or [])}
 
     update_rows = []
     for act in activities_flat:
