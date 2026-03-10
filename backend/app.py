@@ -269,15 +269,20 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
 
 def _enable_dependencies(ss, sheet_id):
     """Enable dependency settings on the sheet so Smartsheet recognizes predecessor links."""
-    project_settings = smartsheet.models.ProjectSettings({
-        "working_days_in_week": 5,
-        "non_working_day_list": [],
-        "length_of_day": 8,
-    })
+    # Step 1: enable dependencies (required before projectSettings can be set)
+    ss.Sheets.update_sheet(
+        sheet_id,
+        smartsheet.models.Sheet({"dependency_enabled": True}),
+    )
+    # Step 2: now set project settings (working calendar)
     ss.Sheets.update_sheet(
         sheet_id,
         smartsheet.models.Sheet({
-            "project_settings": project_settings,
+            "project_settings": smartsheet.models.ProjectSettings({
+                "working_days_in_week": 5,
+                "non_working_day_list": [],
+                "length_of_day": 8,
+            }),
         }),
     )
 
