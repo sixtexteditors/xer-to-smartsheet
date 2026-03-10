@@ -66,7 +66,11 @@ def import_xer():
     try:
         sheet_url = _push_to_smartsheet(api_key, project_name, parsed)
     except smartsheet.exceptions.ApiError as e:
-        err = e.error.result if hasattr(e, "error") and hasattr(e.error, "result") else str(e)
+        try:
+            result = e.error.result
+            err = f"{result.code}: {result.message}"
+        except Exception:
+            err = str(e)
         return jsonify({"error": err}), 500
     except Exception as e:
         return jsonify({"error": str(e), "detail": traceback.format_exc()}), 500
