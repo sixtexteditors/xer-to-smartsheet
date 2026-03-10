@@ -3,6 +3,7 @@ XER Parser - Parses Primavera P6 XER files into structured data.
 Extracts: PROJECT, WBS, TASK, TASKPRED, TASKRSRC, RSRC tables.
 """
 
+import re
 from collections import defaultdict
 from datetime import datetime
 
@@ -33,6 +34,46 @@ def parse_xer(file_content: str) -> dict:
         tid = task["_task_id"]
         resources = taskrsrc.get(tid, [])
         task["assigned_to"] = ", ".join(resources) if resources else ""
+
+    # Build wbs_id -> ancestors list (root-to-node order) for facility/type lookup
+    wbs_node_map = {n["wbs_id"]: n for n in wbs_tree}
+    wbs_ancestors = _build_wbs_ancestors(wbs_node_map)
+
+    _facility_re = re.compile(r"facility\s*#?\s*(\d+)", re.IGNORECASE)
+    _type_keywords = [
+        ("engineering",    "Engineering"),
+        ("procurement",    "Procurement"),
+        ("construction",   "Construction"),
+        ("commissioning",  "Commissioning"),
+    ]
+
+    for task in tasks:
+        try:
+            ancestors = wbs_ancestors.get(task["_wbs_id"], [])
+            names = [a["wbs_name"] for a in ancestors]
+
+            # Facility: first name matching "Facility #N" or "Facility N"
+            facility = ""
+            for name in names:
+                m = _facility_re.search(name)
+                if m:
+                    facility = f"Facility {m.group(1)}"
+                    break
+            task["facility"] = facility
+
+            # Activity Type: first ancestry name containing a keyword
+            activity_type = ""
+            for name in names:
+                for keyword, label in _type_keywords:
+                    if keyword in name.lower():
+                        activity_type = label
+                        break
+                if activity_type:
+                    break
+            task["activity_type"] = activity_type
+        except Exception:
+            task["facility"] = ""
+            task["activity_type"] = ""
 
     activities_by_wbs = defaultdict(list)
     for task in tasks:
@@ -75,7 +116,7 @@ def _build_wbs_tree(rows):
         parent_id = node.get("parent_wbs_id", "")
         result.append({
             "wbs_id": wbs_id,
-            "wbs_name": node.get("wbs_short_name", node.get("wbs_name", "")),
+            "wbs_name": node.get("wbs_name", node.get("wbs_short_name", "")),
             "parent_wbs_id": parent_id if parent_id in wbs_by_id else "",
             "depth": depth,
         })
@@ -86,6 +127,31 @@ def _build_wbs_tree(rows):
         recurse(root_id, 0)
 
     return result
+
+
+def _build_wbs_ancestors(wbs_node_map: dict) -> dict:
+    """
+    Build a mapping of wbs_id -> list of ancestor nodes (root-to-node inclusive).
+    Each entry includes the node itself at the end of the list.
+    """
+    cache = {}
+
+    def get_ancestors(wbs_id):
+        if wbs_id in cache:
+            return cache[wbs_id]
+        node = wbs_node_map.get(wbs_id)
+        if not node:
+            cache[wbs_id] = []
+            return []
+        parent_id = node.get("parent_wbs_id", "")
+        if parent_id and parent_id in wbs_node_map:
+            ancestors = get_ancestors(parent_id) + [node]
+        else:
+            ancestors = [node]
+        cache[wbs_id] = ancestors
+        return ancestors
+
+    return {wbs_id: get_ancestors(wbs_id) for wbs_id in wbs_node_map}
 
 
 def _split_tables(content: str) -> dict:

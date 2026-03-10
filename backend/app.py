@@ -112,7 +112,9 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         {"title": "Finish",       "type": "DATE"},
         {"title": "Duration",     "type": "TEXT_NUMBER"},
         {"title": "Predecessors", "type": "TEXT_NUMBER"},
-        {"title": "Assigned To",  "type": "TEXT_NUMBER"},
+        {"title": "Assigned To",    "type": "TEXT_NUMBER"},
+        {"title": "Facility",        "type": "TEXT_NUMBER"},
+        {"title": "Activity Type",   "type": "TEXT_NUMBER"},
     ]
 
     if existing_id:
@@ -172,6 +174,10 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         cells.append(make_cell("Duration", str(act.get("duration", ""))))
         if act.get("assigned_to"):
             cells.append(make_cell("Assigned To", act["assigned_to"]))
+        if act.get("facility"):
+            cells.append(make_cell("Facility", act["facility"]))
+        if act.get("activity_type"):
+            cells.append(make_cell("Activity Type", act["activity_type"]))
         row.cells = cells
         return row
 
