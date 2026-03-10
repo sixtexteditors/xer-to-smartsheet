@@ -102,7 +102,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         {"title": "Start",        "type": "DATE"},
         {"title": "Finish",       "type": "DATE"},
         {"title": "Duration",     "type": "TEXT_NUMBER"},
-        {"title": "Predecessors", "type": "PREDECESSOR"},
+        {"title": "Predecessors", "type": "TEXT_NUMBER"},
         {"title": "Assigned To",  "type": "TEXT_NUMBER"},
     ]
 
@@ -134,8 +134,6 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         sheet_id = result.result.id
         sheet = ss.Sheets.get_sheet(sheet_id)
         col_map = {c.title: c.id for c in sheet.columns}
-
-    _enable_dependencies(ss, sheet_id)
 
     # --- PASS 1: Insert rows with WBS hierarchy ---
     # Strategy: insert WBS nodes level-by-level (1 batch call per depth), then
@@ -254,22 +252,6 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
     # sheet_data was fetched at the start of Pass 2 and already has permalink
     return sheet_data.permalink
 
-
-def _enable_dependencies(ss, sheet_id):
-    """Set project working-calendar settings on the sheet.
-    Dependency linking is enabled implicitly by using a PREDECESSOR column type.
-    The project settings call is best-effort — skip it silently if the API rejects it.
-    """
-    try:
-        proj = smartsheet.models.ProjectSettings()
-        proj.working_days_in_week = 5
-        proj.non_working_day_list = []
-        proj.length_of_day = 8
-        sheet_update = smartsheet.models.Sheet()
-        sheet_update.project_settings = proj
-        ss.Sheets.update_sheet(sheet_id, sheet_update)
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":
