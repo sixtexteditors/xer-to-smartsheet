@@ -101,7 +101,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         {"title": "Start",        "type": "DATE"},
         {"title": "Finish",       "type": "DATE"},
         {"title": "Duration",     "type": "TEXT_NUMBER"},
-        {"title": "Predecessors", "type": "TEXT_NUMBER"},
+        {"title": "Predecessors", "type": "PREDECESSOR"},
         {"title": "Assigned To",  "type": "TEXT_NUMBER"},
     ]
 
@@ -268,20 +268,20 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
 
 
 def _enable_dependencies(ss, sheet_id):
-    """Enable dependency settings on the sheet so Smartsheet recognizes predecessor links."""
-    # Step 1: enable dependencies (API field: dependenciesEnabled -> dependencies_enabled)
-    # Must be a separate call before projectSettings can be set.
-    sheet_update = smartsheet.models.Sheet()
-    sheet_update.dependencies_enabled = True
-    ss.Sheets.update_sheet(sheet_id, sheet_update)
-    # Step 2: now set project settings (working calendar)
-    proj = smartsheet.models.ProjectSettings()
-    proj.working_days_in_week = 5
-    proj.non_working_day_list = []
-    proj.length_of_day = 8
-    sheet_update2 = smartsheet.models.Sheet()
-    sheet_update2.project_settings = proj
-    ss.Sheets.update_sheet(sheet_id, sheet_update2)
+    """Set project working-calendar settings on the sheet.
+    Dependency linking is enabled implicitly by using a PREDECESSOR column type.
+    The project settings call is best-effort — skip it silently if the API rejects it.
+    """
+    try:
+        proj = smartsheet.models.ProjectSettings()
+        proj.working_days_in_week = 5
+        proj.non_working_day_list = []
+        proj.length_of_day = 8
+        sheet_update = smartsheet.models.Sheet()
+        sheet_update.project_settings = proj
+        ss.Sheets.update_sheet(sheet_id, sheet_update)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
