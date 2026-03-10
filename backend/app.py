@@ -6,6 +6,7 @@ Endpoints:
 """
 
 import os
+from collections import defaultdict
 import smartsheet
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -137,8 +138,12 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
     _enable_dependencies(ss, sheet_id)
 
     # --- PASS 1: Insert rows with WBS hierarchy ---
+    # Strategy: insert WBS nodes level-by-level (1 batch call per depth), then
+    # insert ALL activities in a single global pass (1 batch call per 500 rows).
+    # This is far fewer API calls than inserting per-node for large schedules.
     wbs_id_to_ss_row_id = {}   # wbs_id -> Smartsheet row ID
     task_id_to_ss_row_id = {}  # XER task_id -> Smartsheet row ID
+    batch_size = 500
 
     def make_cell(col_name, value):
         cell = smartsheet.models.Cell()
@@ -146,73 +151,56 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         cell.value = value
         return cell
 
+    def _build_activity_row(act, parent_ss_id=None):
+        row = smartsheet.models.Row()
+        row.to_bottom = True
+        if parent_ss_id:
+            row.parent_id = parent_ss_id
+        cells = [make_cell("Task Name", act.get("task_name", ""))]
+        if act.get("start"):
+            cells.append(make_cell("Start", act["start"]))
+        if act.get("finish"):
+            cells.append(make_cell("Finish", act["finish"]))
+        cells.append(make_cell("Duration", str(act.get("duration", ""))))
+        if act.get("assigned_to"):
+            cells.append(make_cell("Assigned To", act["assigned_to"]))
+        row.cells = cells
+        return row
+
+    # Group WBS nodes by depth so we can batch-insert each level at once.
+    wbs_by_depth = defaultdict(list)
     for node in wbs_tree:
-        wbs_id = node["wbs_id"]
-        wbs_name = node["wbs_name"]
-        parent_wbs_id = node["parent_wbs_id"]
+        wbs_by_depth[node["depth"]].append(node)
 
-        # Insert summary row for this WBS node
-        wbs_row = smartsheet.models.Row()
-        wbs_row.to_bottom = True
-        if parent_wbs_id and parent_wbs_id in wbs_id_to_ss_row_id:
-            wbs_row.parent_id = wbs_id_to_ss_row_id[parent_wbs_id]
-        wbs_row.cells = [make_cell("Task Name", wbs_name)]
-        result = ss.Sheets.add_rows(sheet_id, [wbs_row])
-        wbs_ss_row_id = result.result[0].id
-        wbs_id_to_ss_row_id[wbs_id] = wbs_ss_row_id
-
-        # Insert activity rows as children of this WBS node
-        node_activities = activities_by_wbs.get(wbs_id, [])
-        batch_size = 500
-        for i in range(0, len(node_activities), batch_size):
-            batch = node_activities[i:i + batch_size]
+    for depth in sorted(wbs_by_depth.keys()):
+        level_nodes = wbs_by_depth[depth]
+        for i in range(0, len(level_nodes), batch_size):
+            batch = level_nodes[i:i + batch_size]
             rows = []
-            for act in batch:
-                row = smartsheet.models.Row()
-                row.to_bottom = True
-                row.parent_id = wbs_ss_row_id
-                cells = [make_cell("Task Name", act.get("task_name", ""))]
-                if act.get("start"):
-                    cells.append(make_cell("Start", act["start"]))
-                if act.get("finish"):
-                    cells.append(make_cell("Finish", act["finish"]))
-                cells.append(make_cell("Duration", str(act.get("duration", ""))))
-                if act.get("assigned_to"):
-                    cells.append(make_cell("Assigned To", act["assigned_to"]))
-                row.cells = cells
-                rows.append(row)
-            if rows:
-                result = ss.Sheets.add_rows(sheet_id, rows)
-                for act, returned_row in zip(batch, result.result):
-                    task_id_to_ss_row_id[act["_task_id"]] = returned_row.id
+            for node in batch:
+                wbs_row = smartsheet.models.Row()
+                wbs_row.to_bottom = True
+                parent_wbs_id = node["parent_wbs_id"]
+                if parent_wbs_id and parent_wbs_id in wbs_id_to_ss_row_id:
+                    wbs_row.parent_id = wbs_id_to_ss_row_id[parent_wbs_id]
+                wbs_row.cells = [make_cell("Task Name", node["wbs_name"])]
+                rows.append((node["wbs_id"], wbs_row))
+            result = ss.Sheets.add_rows(sheet_id, [r for _, r in rows])
+            for (wbs_id, _), returned_row in zip(rows, result.result):
+                wbs_id_to_ss_row_id[wbs_id] = returned_row.id
 
-    # Fallback: insert activities whose WBS ID never appeared in wbs_tree
-    # (e.g. XER TASK rows referencing a WBS code not present in PROJWBS).
-    # Without this they would be silently lost.
-    visited_wbs_ids = {node["wbs_id"] for node in wbs_tree}
-    for orphan_wbs_id, orphan_activities in activities_by_wbs.items():
-        if orphan_wbs_id in visited_wbs_ids:
-            continue
-        for i in range(0, len(orphan_activities), batch_size):
-            batch = orphan_activities[i:i + batch_size]
-            rows = []
-            for act in batch:
-                row = smartsheet.models.Row()
-                row.to_bottom = True
-                cells = [make_cell("Task Name", act.get("task_name", ""))]
-                if act.get("start"):
-                    cells.append(make_cell("Start", act["start"]))
-                if act.get("finish"):
-                    cells.append(make_cell("Finish", act["finish"]))
-                cells.append(make_cell("Duration", str(act.get("duration", ""))))
-                if act.get("assigned_to"):
-                    cells.append(make_cell("Assigned To", act["assigned_to"]))
-                row.cells = cells
-                rows.append(row)
-            if rows:
-                result = ss.Sheets.add_rows(sheet_id, rows)
-                for act, returned_row in zip(batch, result.result):
-                    task_id_to_ss_row_id[act["_task_id"]] = returned_row.id
+    # Insert all activities in a single global pass.
+    # Orphan activities (WBS not in tree) go in at the top level.
+    activity_batch = []   # list of (task_id, row)
+    for act in activities_flat:
+        parent_ss_id = wbs_id_to_ss_row_id.get(act["_wbs_id"])
+        activity_batch.append((act["_task_id"], _build_activity_row(act, parent_ss_id)))
+
+    for i in range(0, len(activity_batch), batch_size):
+        batch = activity_batch[i:i + batch_size]
+        result = ss.Sheets.add_rows(sheet_id, [r for _, r in batch])
+        for (task_id, _), returned_row in zip(batch, result.result):
+            task_id_to_ss_row_id[task_id] = returned_row.id
 
     # --- PASS 2: Update predecessors with actual Smartsheet row numbers ---
     sheet_data = ss.Sheets.get_sheet(sheet_id)

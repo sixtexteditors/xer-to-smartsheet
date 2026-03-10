@@ -10,4 +10,4 @@ COPY frontend/ ./frontend/
 
 EXPOSE 8080
 
-CMD gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 120 app:app
+CMD gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 600 app:app
