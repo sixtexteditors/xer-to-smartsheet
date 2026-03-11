@@ -8,6 +8,7 @@ Endpoints:
 import os
 import traceback
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import smartsheet
 import smartsheet.exceptions
 from flask import Flask, request, jsonify
@@ -189,41 +190,63 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
     for node in wbs_tree:
         wbs_by_depth[node["depth"]].append(node)
 
+    def _insert_wbs_group(parent_wbs_id, siblings):
+        parent_ss_id = wbs_id_to_ss_row_id.get(parent_wbs_id) if parent_wbs_id else None
+        group_results = []
+        for i in range(0, len(siblings), batch_size):
+            batch = siblings[i:i + batch_size]
+            rows = []
+            for node in batch:
+                wbs_row = smartsheet.models.Row()
+                wbs_row.to_bottom = True
+                if parent_ss_id:
+                    wbs_row.parent_id = parent_ss_id
+                wbs_row.cells = [make_cell("Task Name", node["wbs_name"])]
+                rows.append((node["wbs_id"], wbs_row))
+            result = ss.Sheets.add_rows(sheet_id, [r for _, r in rows])
+            returned = result.result if isinstance(result.result, list) else [result.result]
+            for (wbs_id, _), returned_row in zip(rows, returned):
+                group_results.append((wbs_id, returned_row.id))
+        return group_results
+
     for depth in sorted(wbs_by_depth.keys()):
         by_parent = defaultdict(list)
         for node in wbs_by_depth[depth]:
             by_parent[node["parent_wbs_id"]].append(node)
 
-        for parent_wbs_id, siblings in by_parent.items():
-            parent_ss_id = wbs_id_to_ss_row_id.get(parent_wbs_id) if parent_wbs_id else None
-            for i in range(0, len(siblings), batch_size):
-                batch = siblings[i:i + batch_size]
-                rows = []
-                for node in batch:
-                    wbs_row = smartsheet.models.Row()
-                    wbs_row.to_bottom = True
-                    if parent_ss_id:
-                        wbs_row.parent_id = parent_ss_id
-                    wbs_row.cells = [make_cell("Task Name", node["wbs_name"])]
-                    rows.append((node["wbs_id"], wbs_row))
-                result = ss.Sheets.add_rows(sheet_id, [r for _, r in rows])
-                returned = result.result if isinstance(result.result, list) else [result.result]
-                for (wbs_id, _), returned_row in zip(rows, returned):
-                    wbs_id_to_ss_row_id[wbs_id] = returned_row.id
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(_insert_wbs_group, parent_wbs_id, siblings): parent_wbs_id
+                for parent_wbs_id, siblings in by_parent.items()
+            }
+            for future in as_completed(futures):
+                for wbs_id, ss_row_id in future.result():
+                    wbs_id_to_ss_row_id[wbs_id] = ss_row_id
 
     # Activities: group by WBS parent so each batch shares the same parent_id.
     by_parent_ss = defaultdict(list)
     for act in activities_flat:
         by_parent_ss[wbs_id_to_ss_row_id.get(act["_wbs_id"])].append(act)
 
-    for parent_ss_id, acts in by_parent_ss.items():
+    def _insert_activity_group(parent_ss_id, acts):
+        group_results = []
         for i in range(0, len(acts), batch_size):
             batch = acts[i:i + batch_size]
             rows = [(act["_task_id"], _build_activity_row(act, parent_ss_id)) for act in batch]
             result = ss.Sheets.add_rows(sheet_id, [r for _, r in rows])
             returned = result.result if isinstance(result.result, list) else [result.result]
             for (task_id, _), returned_row in zip(rows, returned):
-                task_id_to_ss_row_id[task_id] = returned_row.id
+                group_results.append((task_id, returned_row.id))
+        return group_results
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(_insert_activity_group, parent_ss_id, acts): parent_ss_id
+            for parent_ss_id, acts in by_parent_ss.items()
+        }
+        for future in as_completed(futures):
+            for task_id, ss_row_id in future.result():
+                task_id_to_ss_row_id[task_id] = ss_row_id
 
     # --- PASS 2: Update predecessors with actual Smartsheet row numbers ---
     sheet_data = ss.Sheets.get_sheet(sheet_id)
