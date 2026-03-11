@@ -29,7 +29,7 @@ def _with_retry(fn, max_attempts=6):
             except Exception:
                 code = None
             # 4003 = rate limit exceeded, 4004 = server timeout
-            if code in (4003, 4004) and attempt < max_attempts - 1:
+            if code in (1063, 4003, 4004) and attempt < max_attempts - 1:
                 wait = (2 ** attempt) + random.uniform(0, 1)
                 time.sleep(wait)
             else:
@@ -253,9 +253,18 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
                 executor.submit(_insert_wbs_group, parent_wbs_id, siblings): parent_wbs_id
                 for parent_wbs_id, siblings in by_parent.items()
             }
+            errors = []
             for future in as_completed(futures):
-                for wbs_id, ss_row_id in future.result():
-                    wbs_id_to_ss_row_id[wbs_id] = ss_row_id
+                try:
+                    for wbs_id, ss_row_id in future.result():
+                        wbs_id_to_ss_row_id[wbs_id] = ss_row_id
+                except Exception as e:
+                    errors.append(str(e))
+            if errors:
+                raise Exception(f"WBS insertion failed: {errors[0]}")
+
+    # Brief pause to ensure WBS rows are fully committed before activities reference them as parents
+    time.sleep(2)
 
     # Activities: group by WBS parent so each batch shares the same parent_id.
     by_parent_ss = defaultdict(list)
@@ -281,9 +290,15 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
             executor.submit(_insert_activity_group, parent_ss_id, acts): parent_ss_id
             for parent_ss_id, acts in by_parent_ss.items()
         }
+        errors = []
         for future in as_completed(futures):
-            for task_id, ss_row_id in future.result():
-                task_id_to_ss_row_id[task_id] = ss_row_id
+            try:
+                for task_id, ss_row_id in future.result():
+                    task_id_to_ss_row_id[task_id] = ss_row_id
+            except Exception as e:
+                errors.append(str(e))
+        if errors:
+            raise Exception(f"Activity insertion failed: {errors[0]}")
 
     # Build task_id -> task_name lookup for predecessor/dependent name columns
     task_id_to_name = {act["_task_id"]: act["task_name"] for act in activities_flat}
@@ -388,8 +403,14 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(_send_update_batch, batch) for batch in update_batches]
+        errors = []
         for future in as_completed(futures):
-            future.result()
+            try:
+                future.result()
+            except Exception as e:
+                errors.append(str(e))
+        if errors:
+            raise Exception(f"Predecessor update failed: {errors[0]}")
 
     # sheet_data was fetched at the start of Pass 2 and already has permalink
     return sheet_data.permalink
