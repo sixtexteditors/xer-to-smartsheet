@@ -197,6 +197,8 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         wbs_by_depth[node["depth"]].append(node)
 
     def _insert_wbs_group(parent_wbs_id, siblings):
+        ss_local = smartsheet.Smartsheet(api_key)
+        ss_local.errors_as_exceptions(True)
         parent_ss_id = wbs_id_to_ss_row_id.get(parent_wbs_id) if parent_wbs_id else None
         group_results = []
         for i in range(0, len(siblings), batch_size):
@@ -209,7 +211,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
                     wbs_row.parent_id = parent_ss_id
                 wbs_row.cells = [make_cell("Task Name", node["wbs_name"])]
                 rows.append((node["wbs_id"], wbs_row))
-            result = ss.Sheets.add_rows(sheet_id, [r for _, r in rows])
+            result = ss_local.Sheets.add_rows(sheet_id, [r for _, r in rows])
             returned = result.result if isinstance(result.result, list) else [result.result]
             for (wbs_id, _), returned_row in zip(rows, returned):
                 group_results.append((wbs_id, returned_row.id))
@@ -220,7 +222,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         for node in wbs_by_depth[depth]:
             by_parent[node["parent_wbs_id"]].append(node)
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {
                 executor.submit(_insert_wbs_group, parent_wbs_id, siblings): parent_wbs_id
                 for parent_wbs_id, siblings in by_parent.items()
@@ -235,17 +237,19 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         by_parent_ss[wbs_id_to_ss_row_id.get(act["_wbs_id"])].append(act)
 
     def _insert_activity_group(parent_ss_id, acts):
+        ss_local = smartsheet.Smartsheet(api_key)
+        ss_local.errors_as_exceptions(True)
         group_results = []
         for i in range(0, len(acts), batch_size):
             batch = acts[i:i + batch_size]
             rows = [(act["_task_id"], _build_activity_row(act, parent_ss_id)) for act in batch]
-            result = ss.Sheets.add_rows(sheet_id, [r for _, r in rows])
+            result = ss_local.Sheets.add_rows(sheet_id, [r for _, r in rows])
             returned = result.result if isinstance(result.result, list) else [result.result]
             for (task_id, _), returned_row in zip(rows, returned):
                 group_results.append((task_id, returned_row.id))
         return group_results
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
             executor.submit(_insert_activity_group, parent_ss_id, acts): parent_ss_id
             for parent_ss_id, acts in by_parent_ss.items()
