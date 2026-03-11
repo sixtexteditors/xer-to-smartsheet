@@ -120,7 +120,11 @@ def _build_wbs_tree(rows):
             "parent_wbs_id": parent_id if parent_id in wbs_by_id else "",
             "depth": depth,
         })
-        for child_id in children_map.get(wbs_id, []):
+        sorted_children = sorted(
+            children_map.get(wbs_id, []),
+            key=lambda cid: int(wbs_by_id[cid].get("seq_num", 0) or 0)
+        )
+        for child_id in sorted_children:
             recurse(child_id, depth + 1)
 
     for root_id in roots:
@@ -188,6 +192,8 @@ def _parse_tasks(rows):
     tasks = []
     task_id_map = {}
     for i, row in enumerate(rows, start=1):
+        if row.get("task_type") == "TT_WBS":
+            continue
         task_id = row.get("task_id", "")
         task_id_map[task_id] = i
         duration_hrs = float(row.get("target_drtn_hr_cnt", "0") or "0")
