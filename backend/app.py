@@ -124,8 +124,9 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
       add_rows requires all rows in one call to share the same parent_id.
       With 800 unique WBS parents this meant 800 parallel calls, causing 1063
       (invalid parentId) errors due to Smartsheet eventual consistency.
-      update_rows allows mixed parent_ids per batch (unlike add_rows),
-      so 3,781 activities need only ~8 API calls instead of 800.
+      update_rows has the same parent_id restriction as add_rows, but since
+      activities are already in the sheet, 1063 (invalid parentId) errors
+      cannot occur — all referenced parent rows definitely exist.
 
     Returns the permalink URL of the sheet.
     """
@@ -287,10 +288,10 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
 
     # -------------------------------------------------------------------------
     # PASS 2a: Place each activity under its WBS parent via update_rows
-    # update_rows allows mixed parent_ids per batch (unlike add_rows),
-    # so 3,781 activities need only ~8 API calls instead of 800.
+    # update_rows has the same restriction as add_rows: all rows in one call
+    # must share the same parent_id. Group by parent and parallelize.
     # -------------------------------------------------------------------------
-    parent_update_rows = []
+    by_parent_update = defaultdict(list)
     for act in activities_flat:
         tid = act["_task_id"]
         act_ss_row_id = task_id_to_ss_row_id.get(tid)
@@ -302,10 +303,28 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         update_row = smartsheet.models.Row()
         update_row.id = act_ss_row_id
         update_row.parent_id = parent_ss_id
-        parent_update_rows.append(update_row)
+        by_parent_update[parent_ss_id].append(update_row)
 
-    for i in range(0, len(parent_update_rows), batch_size):
-        _with_retry(lambda b=parent_update_rows[i:i + batch_size]: ss.Sheets.update_rows(sheet_id, b))
+    def _send_parent_group(parent_ss_id, rows):
+        ss_local = smartsheet.Smartsheet(api_key)
+        ss_local.errors_as_exceptions(True)
+        for i in range(0, len(rows), batch_size):
+            _batch = rows[i:i + batch_size]
+            _with_retry(lambda b=_batch: ss_local.Sheets.update_rows(sheet_id, b))
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(_send_parent_group, pid, rows): pid
+            for pid, rows in by_parent_update.items()
+        }
+        errors = []
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                errors.append(str(e))
+        if errors:
+            raise Exception(f"Activity hierarchy placement failed: {errors[0]}")
 
     # -------------------------------------------------------------------------
     # PASS 2b: Update predecessor, predecessor names, dependent, dependent name columns
