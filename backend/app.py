@@ -105,6 +105,7 @@ def import_xer():
 
 def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
     ss = smartsheet.Smartsheet(api_key)
+    ss._session.timeout = 60
     ss.errors_as_exceptions(True)
 
     wbs_tree = parsed["wbs_tree"]
@@ -167,7 +168,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         sheet = ss.Sheets.get_sheet(sheet_id)
         col_map = {c.title: c.id for c in sheet.columns}
 
-    ADD_BATCH = 500
+    ADD_BATCH = 200
 
     def make_cell(col_name, value):
         cell = smartsheet.models.Cell()
