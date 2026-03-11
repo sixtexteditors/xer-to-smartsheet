@@ -136,10 +136,10 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
     if existing_id:
         sheet = ss.Sheets.get_sheet(existing_id)
         if sheet.rows:
-            all_row_ids = [r.id for r in sheet.rows]
-            for i in range(0, len(all_row_ids), 100):
+            root_row_ids = [r.id for r in sheet.rows if not getattr(r, "parent_id", None)]
+            for i in range(0, len(root_row_ids), 100):
                 _with_retry(
-                    lambda ids=all_row_ids[i:i + 100]: ss.Sheets.delete_rows(existing_id, ids)
+                    lambda ids=root_row_ids[i:i + 100]: ss.Sheets.delete_rows(existing_id, ids)
                 )
         sheet_id = existing_id
         sheet = ss.Sheets.get_sheet(sheet_id)
