@@ -17,29 +17,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from xer_parser import parse_xer, _lag_to_days, _normalize_rel_type
 
-
-def _with_retry(fn, max_attempts=6):
-    """Call fn(), retrying on Smartsheet rate limit or transient errors with exponential backoff."""
-    for attempt in range(max_attempts):
-        try:
-            return fn()
-        except smartsheet.exceptions.ApiError as e:
-            try:
-                code = e.error.result.code
-            except Exception:
-                code = None
-            # 4003 = rate limit exceeded, 4004 = server timeout
-            if code in (1063, 4003, 4004) and attempt < max_attempts - 1:
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(wait)
-            else:
-                raise
-        except Exception:
-            if attempt < max_attempts - 1:
-                time.sleep(1 + random.uniform(0, 0.5))
-            else:
-                raise
-
 # In Docker, frontend is at /app/frontend (sibling of this file).
 # In local dev (running from backend/), frontend is at ../frontend.
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +28,29 @@ app = Flask(__name__, static_folder=_frontend, static_url_path="")
 CORS(app)
 
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB upload limit
+
+
+def _with_retry(fn, max_attempts=6):
+    """Call fn(), retrying on Smartsheet rate limit or transient errors with exponential backoff."""
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except smartsheet.exceptions.ApiError as e:
+            try:
+                code = e.error.result.code
+            except Exception:
+                code = None
+            # 1063 = invalid parentId (eventual consistency), 4003 = rate limit, 4004 = timeout
+            if code in (1063, 4003, 4004) and attempt < max_attempts - 1:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(wait)
+            else:
+                raise
+        except Exception:
+            if attempt < max_attempts - 1:
+                time.sleep(1 + random.uniform(0, 0.5))
+            else:
+                raise
 
 
 @app.route("/")
@@ -112,19 +112,33 @@ def import_xer():
 def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
     """
     Create or overwrite a Smartsheet with WBS hierarchy and activities.
-    Uses a two-pass approach: insert all rows first, then update predecessor
-    cells with correct Smartsheet row numbers.
+
+    Flow:
+      1. Find or create sheet
+      2. Insert WBS rows in parallel by depth
+      3. Insert all activities flat (no parent) in sequential batches
+      4. Pass 2a: update_rows to place each activity under its WBS parent
+      5. Pass 2b: fetch sheet for row numbers, update predecessor/dependent columns
+
+    Why flat insert + separate hierarchy pass:
+      add_rows requires all rows in one call to share the same parent_id.
+      With 800 unique WBS parents this meant 800 parallel calls, causing 1063
+      (invalid parentId) errors due to Smartsheet eventual consistency.
+      update_rows allows mixed parent_ids per batch (unlike add_rows),
+      so 3,781 activities need only ~8 API calls instead of 800.
+
     Returns the permalink URL of the sheet.
     """
     ss = smartsheet.Smartsheet(api_key)
     ss.errors_as_exceptions(True)
 
     wbs_tree = parsed["wbs_tree"]
-    activities_by_wbs = parsed["activities_by_wbs"]
     activities_flat = parsed["activities_flat"]
     predecessor_map = parsed["predecessor_map"]
 
-    # --- Find or create sheet ---
+    # -------------------------------------------------------------------------
+    # Find or create sheet
+    # -------------------------------------------------------------------------
     existing_id = None
     sheets = ss.Sheets.list_sheets(include_all=True)
     for s in sheets.data:
@@ -133,14 +147,14 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
             break
 
     column_defs = [
-        {"title": "Task Name",    "type": "TEXT_NUMBER", "primary": True},
-        {"title": "Start",        "type": "DATE"},
-        {"title": "Finish",       "type": "DATE"},
-        {"title": "Duration",     "type": "TEXT_NUMBER"},
-        {"title": "Predecessors", "type": "TEXT_NUMBER"},
-        {"title": "Assigned To",    "type": "TEXT_NUMBER"},
-        {"title": "Facility",        "type": "TEXT_NUMBER"},
-        {"title": "Activity Type",   "type": "TEXT_NUMBER"},
+        {"title": "Task Name",             "type": "TEXT_NUMBER", "primary": True},
+        {"title": "Start",                 "type": "DATE"},
+        {"title": "Finish",                "type": "DATE"},
+        {"title": "Duration",              "type": "TEXT_NUMBER"},
+        {"title": "Predecessors",          "type": "TEXT_NUMBER"},
+        {"title": "Assigned To",           "type": "TEXT_NUMBER"},
+        {"title": "Facility",              "type": "TEXT_NUMBER"},
+        {"title": "Activity Type",         "type": "TEXT_NUMBER"},
         {"title": "Activity ID",           "type": "TEXT_NUMBER"},
         {"title": "Predecessor Names",     "type": "TEXT_NUMBER"},
         {"title": "Dependent Row Numbers", "type": "TEXT_NUMBER"},
@@ -148,8 +162,6 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
     ]
 
     if existing_id:
-        # Delete only root-level rows — Smartsheet cascades to children automatically.
-        # Passing child row IDs after their parent is already deleted causes API errors.
         sheet = ss.Sheets.get_sheet(existing_id)
         if sheet.rows:
             root_ids = [r.id for r in sheet.rows if not getattr(r, "parent_id", None)]
@@ -157,7 +169,6 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
                 ss.Sheets.delete_rows(existing_id, root_ids[i:i + 450])
         sheet_id = existing_id
         col_map = {c.title: c.id for c in sheet.columns}
-        # Add any columns that exist in our definition but are missing from the sheet
         for col_def in column_defs:
             if col_def["title"] not in col_map and not col_def.get("primary"):
                 col_obj = smartsheet.models.Column(
@@ -167,7 +178,6 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
                 added_cols = added.result if isinstance(added.result, list) else [added.result]
                 col_map[col_def["title"]] = added_cols[0].id
     else:
-        # Create new sheet
         cols = [smartsheet.models.Column({"title": c["title"], "type": c["type"],
                                           "primary": c.get("primary", False)})
                 for c in column_defs]
@@ -177,12 +187,6 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         sheet = ss.Sheets.get_sheet(sheet_id)
         col_map = {c.title: c.id for c in sheet.columns}
 
-    # --- PASS 1: Insert rows with WBS hierarchy ---
-    # Strategy: insert WBS nodes level-by-level (1 batch call per depth), then
-    # insert ALL activities in a single global pass (1 batch call per 500 rows).
-    # This is far fewer API calls than inserting per-node for large schedules.
-    wbs_id_to_ss_row_id = {}   # wbs_id -> Smartsheet row ID
-    task_id_to_ss_row_id = {}  # XER task_id -> Smartsheet row ID
     batch_size = 500
 
     def make_cell(col_name, value):
@@ -191,11 +195,10 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         cell.value = value
         return cell
 
-    def _build_activity_row(act, parent_ss_id=None):
+    def _build_activity_row(act):
+        """Build a flat Row for an activity (no parent_id — hierarchy set in Pass 2a)."""
         row = smartsheet.models.Row()
         row.to_bottom = True
-        if parent_ss_id:
-            row.parent_id = parent_ss_id
         cells = [make_cell("Task Name", act.get("task_name", ""))]
         if act.get("start"):
             cells.append(make_cell("Start", act["start"]))
@@ -213,10 +216,13 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         row.cells = cells
         return row
 
-    # Smartsheet requires all rows in one add_rows call to share the same
-    # parent_id value. Group by parent before batching.
+    # -------------------------------------------------------------------------
+    # PASS 1a: Insert WBS rows in parallel, depth by depth
+    # Depths are processed sequentially because each level depends on parent
+    # SS row IDs from the level above. Groups within a depth run in parallel.
+    # -------------------------------------------------------------------------
+    wbs_id_to_ss_row_id = {}
 
-    # WBS nodes: group by depth, then by parent within each depth.
     wbs_by_depth = defaultdict(list)
     for node in wbs_tree:
         wbs_by_depth[node["depth"]].append(node)
@@ -236,8 +242,8 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
                     wbs_row.parent_id = parent_ss_id
                 wbs_row.cells = [make_cell("Task Name", node["wbs_name"])]
                 rows.append((node["wbs_id"], wbs_row))
-            _rows = [r for _, r in rows]
-            result = _with_retry(lambda r=_rows: ss_local.Sheets.add_rows(sheet_id, r))
+            _batch_rows = [r for _, r in rows]
+            result = _with_retry(lambda r=_batch_rows: ss_local.Sheets.add_rows(sheet_id, r))
             returned = result.result if isinstance(result.result, list) else [result.result]
             for (wbs_id, _), returned_row in zip(rows, returned):
                 group_results.append((wbs_id, returned_row.id))
@@ -263,53 +269,55 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
             if errors:
                 raise Exception(f"WBS insertion failed: {errors[0]}")
 
-    # Brief pause to ensure WBS rows are fully committed before activities reference them as parents
-    time.sleep(2)
+    # -------------------------------------------------------------------------
+    # PASS 1b: Insert all activities flat (no parent_id)
+    # Brief sleep first to let WBS rows fully commit on Smartsheet's side.
+    # -------------------------------------------------------------------------
+    time.sleep(3)
 
-    # Activities: group by WBS parent so each batch shares the same parent_id.
-    by_parent_ss = defaultdict(list)
+    task_id_to_ss_row_id = {}
+    for i in range(0, len(activities_flat), batch_size):
+        batch = activities_flat[i:i + batch_size]
+        rows = [(act["_task_id"], _build_activity_row(act)) for act in batch]
+        _batch_rows = [r for _, r in rows]
+        result = _with_retry(lambda r=_batch_rows: ss.Sheets.add_rows(sheet_id, r))
+        returned = result.result if isinstance(result.result, list) else [result.result]
+        for (task_id, _), returned_row in zip(rows, returned):
+            task_id_to_ss_row_id[task_id] = returned_row.id
+
+    # -------------------------------------------------------------------------
+    # PASS 2a: Place each activity under its WBS parent via update_rows
+    # update_rows allows mixed parent_ids per batch (unlike add_rows),
+    # so 3,781 activities need only ~8 API calls instead of 800.
+    # -------------------------------------------------------------------------
+    parent_update_rows = []
     for act in activities_flat:
-        by_parent_ss[wbs_id_to_ss_row_id.get(act["_wbs_id"])].append(act)
+        tid = act["_task_id"]
+        act_ss_row_id = task_id_to_ss_row_id.get(tid)
+        if act_ss_row_id is None:
+            continue
+        parent_ss_id = wbs_id_to_ss_row_id.get(act["_wbs_id"])
+        if parent_ss_id is None:
+            continue
+        update_row = smartsheet.models.Row()
+        update_row.id = act_ss_row_id
+        update_row.parent_id = parent_ss_id
+        parent_update_rows.append(update_row)
 
-    def _insert_activity_group(parent_ss_id, acts):
-        ss_local = smartsheet.Smartsheet(api_key)
-        ss_local.errors_as_exceptions(True)
-        group_results = []
-        for i in range(0, len(acts), batch_size):
-            batch = acts[i:i + batch_size]
-            rows = [(act["_task_id"], _build_activity_row(act, parent_ss_id)) for act in batch]
-            _rows = [r for _, r in rows]
-            result = _with_retry(lambda r=_rows: ss_local.Sheets.add_rows(sheet_id, r))
-            returned = result.result if isinstance(result.result, list) else [result.result]
-            for (task_id, _), returned_row in zip(rows, returned):
-                group_results.append((task_id, returned_row.id))
-        return group_results
+    for i in range(0, len(parent_update_rows), batch_size):
+        _with_retry(lambda b=parent_update_rows[i:i + batch_size]: ss.Sheets.update_rows(sheet_id, b))
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {
-            executor.submit(_insert_activity_group, parent_ss_id, acts): parent_ss_id
-            for parent_ss_id, acts in by_parent_ss.items()
-        }
-        errors = []
-        for future in as_completed(futures):
-            try:
-                for task_id, ss_row_id in future.result():
-                    task_id_to_ss_row_id[task_id] = ss_row_id
-            except Exception as e:
-                errors.append(str(e))
-        if errors:
-            raise Exception(f"Activity insertion failed: {errors[0]}")
-
-    # Build task_id -> task_name lookup for predecessor/dependent name columns
+    # -------------------------------------------------------------------------
+    # PASS 2b: Update predecessor, predecessor names, dependent, dependent name columns
+    # Fetch the sheet first to get accurate row numbers after hierarchy placement.
+    # -------------------------------------------------------------------------
     task_id_to_name = {act["_task_id"]: act["task_name"] for act in activities_flat}
 
-    # Build dependent_map: task_id -> list of task_ids that depend on it (inverse of predecessor_map)
     dependent_map = defaultdict(list)
     for task_id, preds in predecessor_map.items():
         for p in preds:
             dependent_map[p["pred_task_id"]].append(task_id)
 
-    # --- PASS 2: Update predecessors with actual Smartsheet row numbers ---
     sheet_data = ss.Sheets.get_sheet(sheet_id)
     ss_row_id_to_row_number = {r.id: r.row_number for r in (sheet_data.rows or [])}
 
@@ -322,7 +330,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
 
         cells_to_update = []
 
-        # Predecessor row numbers (existing column)
+        # Predecessors (row numbers + names)
         preds = predecessor_map.get(tid, [])
         pred_parts = []
         pred_name_parts = []
@@ -359,7 +367,7 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
             cell.value = ", ".join(pred_name_parts)
             cells_to_update.append(cell)
 
-        # Dependent row numbers and names
+        # Dependents (row numbers + names)
         dep_tids = dependent_map.get(tid, [])
         dep_parts = []
         dep_name_parts = []
@@ -393,28 +401,10 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
             update_row.cells = cells_to_update
             update_rows.append(update_row)
 
-    batch_size = 500
-    update_batches = [update_rows[i:i + batch_size] for i in range(0, len(update_rows), batch_size)]
+    for i in range(0, len(update_rows), batch_size):
+        _with_retry(lambda b=update_rows[i:i + batch_size]: ss.Sheets.update_rows(sheet_id, b))
 
-    def _send_update_batch(batch):
-        ss_local = smartsheet.Smartsheet(api_key)
-        ss_local.errors_as_exceptions(True)
-        return _with_retry(lambda: ss_local.Sheets.update_rows(sheet_id, batch))
-
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(_send_update_batch, batch) for batch in update_batches]
-        errors = []
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                errors.append(str(e))
-        if errors:
-            raise Exception(f"Predecessor update failed: {errors[0]}")
-
-    # sheet_data was fetched at the start of Pass 2 and already has permalink
     return sheet_data.permalink
-
 
 
 if __name__ == "__main__":
