@@ -116,6 +116,10 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
         {"title": "Assigned To",    "type": "TEXT_NUMBER"},
         {"title": "Facility",        "type": "TEXT_NUMBER"},
         {"title": "Activity Type",   "type": "TEXT_NUMBER"},
+        {"title": "Activity ID",           "type": "TEXT_NUMBER"},
+        {"title": "Predecessor Names",     "type": "TEXT_NUMBER"},
+        {"title": "Dependent Row Numbers", "type": "TEXT_NUMBER"},
+        {"title": "Dependent Names",       "type": "TEXT_NUMBER"},
     ]
 
     if existing_id:
@@ -179,6 +183,8 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
             cells.append(make_cell("Facility", act["facility"]))
         if act.get("activity_type"):
             cells.append(make_cell("Activity Type", act["activity_type"]))
+        if act.get("activity_id"):
+            cells.append(make_cell("Activity ID", act["activity_id"]))
         row.cells = cells
         return row
 
@@ -248,6 +254,15 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
             for task_id, ss_row_id in future.result():
                 task_id_to_ss_row_id[task_id] = ss_row_id
 
+    # Build task_id -> task_name lookup for predecessor/dependent name columns
+    task_id_to_name = {act["_task_id"]: act["task_name"] for act in activities_flat}
+
+    # Build dependent_map: task_id -> list of task_ids that depend on it (inverse of predecessor_map)
+    dependent_map = defaultdict(list)
+    for task_id, preds in predecessor_map.items():
+        for p in preds:
+            dependent_map[p["pred_task_id"]].append(task_id)
+
     # --- PASS 2: Update predecessors with actual Smartsheet row numbers ---
     sheet_data = ss.Sheets.get_sheet(sheet_id)
     ss_row_id_to_row_number = {r.id: r.row_number for r in (sheet_data.rows or [])}
@@ -255,11 +270,16 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
     update_rows = []
     for act in activities_flat:
         tid = act["_task_id"]
-        preds = predecessor_map.get(tid, [])
-        if not preds:
+        act_ss_row_id = task_id_to_ss_row_id.get(tid)
+        if act_ss_row_id is None:
             continue
 
+        cells_to_update = []
+
+        # Predecessor row numbers (existing column)
+        preds = predecessor_map.get(tid, [])
         pred_parts = []
+        pred_name_parts = []
         for p in preds:
             pred_tid = p["pred_task_id"]
             pred_ss_row_id = task_id_to_ss_row_id.get(pred_tid)
@@ -277,21 +297,55 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
                 pred_parts.append(f"{row_number}{rel_type}")
             else:
                 pred_parts.append(str(row_number))
+            pred_name = task_id_to_name.get(pred_tid, "")
+            if pred_name:
+                pred_name_parts.append(pred_name)
 
-        if not pred_parts:
-            continue
+        if pred_parts:
+            cell = smartsheet.models.Cell()
+            cell.column_id = col_map["Predecessors"]
+            cell.value = ",".join(pred_parts)
+            cells_to_update.append(cell)
 
-        act_ss_row_id = task_id_to_ss_row_id.get(tid)
-        if act_ss_row_id is None:
-            continue
+        if pred_name_parts:
+            cell = smartsheet.models.Cell()
+            cell.column_id = col_map["Predecessor Names"]
+            cell.value = ", ".join(pred_name_parts)
+            cells_to_update.append(cell)
 
-        update_row = smartsheet.models.Row()
-        update_row.id = act_ss_row_id
-        cell = smartsheet.models.Cell()
-        cell.column_id = col_map["Predecessors"]
-        cell.value = ",".join(pred_parts)
-        update_row.cells = [cell]
-        update_rows.append(update_row)
+        # Dependent row numbers and names
+        dep_tids = dependent_map.get(tid, [])
+        dep_parts = []
+        dep_name_parts = []
+        for dep_tid in dep_tids:
+            dep_ss_row_id = task_id_to_ss_row_id.get(dep_tid)
+            if dep_ss_row_id is None:
+                continue
+            row_number = ss_row_id_to_row_number.get(dep_ss_row_id)
+            if row_number is None:
+                continue
+            dep_parts.append(str(row_number))
+            dep_name = task_id_to_name.get(dep_tid, "")
+            if dep_name:
+                dep_name_parts.append(dep_name)
+
+        if dep_parts:
+            cell = smartsheet.models.Cell()
+            cell.column_id = col_map["Dependent Row Numbers"]
+            cell.value = ",".join(dep_parts)
+            cells_to_update.append(cell)
+
+        if dep_name_parts:
+            cell = smartsheet.models.Cell()
+            cell.column_id = col_map["Dependent Names"]
+            cell.value = ", ".join(dep_name_parts)
+            cells_to_update.append(cell)
+
+        if cells_to_update:
+            update_row = smartsheet.models.Row()
+            update_row.id = act_ss_row_id
+            update_row.cells = cells_to_update
+            update_rows.append(update_row)
 
     batch_size = 500
     for i in range(0, len(update_rows), batch_size):

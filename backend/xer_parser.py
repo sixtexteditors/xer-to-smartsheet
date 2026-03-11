@@ -203,6 +203,7 @@ def _parse_tasks(rows):
         tasks.append({
             "_task_id": task_id,
             "_wbs_id": row.get("wbs_id", ""),
+            "activity_id": row.get("task_code", ""),
             "task_name": row.get("task_name", ""),
             "start": _format_date(start_raw),
             "finish": _format_date(finish_raw),
