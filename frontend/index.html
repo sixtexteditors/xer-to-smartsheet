@@ -82,7 +82,8 @@ function App() {
   const handleSubmit = async () => {
     if (!apiKey) return setStatus({type:"error", message:"Please enter your Smartsheet API key."});
     if (!file)   return setStatus({type:"error", message:"Please select an XER file."});
-    setLoading(true); setStatus({type:"loading", message:"Parsing XER and pushing to Smartsheet..."});
+    setLoading(true);
+    setStatus({type:"loading", message:"Uploading and parsing XER file..."});
 
     const form = new FormData();
     form.append("file", file);
@@ -96,17 +97,36 @@ function App() {
       });
       const data = await res.json();
       if (!res.ok) {
-        setStatus({type:"error", message: data.error || "Unknown error occurred."});
-      } else {
-        setStatus({
-          type: "success",
-          message: `✓ Imported ${data.activity_count} activities into "${data.sheet_name}"`,
-          url: data.sheet_url,
-        });
+        setStatus({type:"error", message: data.error || "Unknown error."});
+        setLoading(false);
+        return;
       }
+
+      const jobId = data.job_id;
+      setStatus({type:"loading", message:"Importing to Smartsheet — this takes 10-20 minutes for large schedules. Do not close this tab."});
+
+      const poll = async () => {
+        try {
+          const r = await fetch(`/api/status/${jobId}`);
+          const d = await r.json();
+          if (d.status === "done") {
+            setStatus({type:"success", message:`✓ Imported ${d.activity_count} activities into "${d.sheet_name}"`, url: d.sheet_url});
+            setLoading(false);
+          } else if (d.status === "error") {
+            setStatus({type:"error", message: d.error || "Import failed."});
+            setLoading(false);
+          } else {
+            setTimeout(poll, 5000);
+          }
+        } catch (e) {
+          setStatus({type:"error", message:"Lost connection to server."});
+          setLoading(false);
+        }
+      };
+      setTimeout(poll, 5000);
+
     } catch (err) {
       setStatus({type:"error", message:"Network error. Is the server running?"});
-    } finally {
       setLoading(false);
     }
   };

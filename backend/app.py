@@ -8,6 +8,8 @@ import os
 import time
 import random
 import traceback
+import threading
+import uuid
 from collections import defaultdict
 import smartsheet
 import smartsheet.exceptions
@@ -22,6 +24,8 @@ if not os.path.isdir(_frontend):
 
 app = Flask(__name__, static_folder=_frontend, static_url_path="")
 CORS(app)
+
+jobs = {}  # job_id -> {status, message, url, error}
 
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
@@ -83,24 +87,31 @@ def import_xer():
     if not activities_flat:
         return jsonify({"error": "No activities found in XER file"}), 422
 
-    try:
-        sheet_url = _push_to_smartsheet(api_key, project_name, parsed)
-    except smartsheet.exceptions.ApiError as e:
-        try:
-            result = e.error.result
-            err = f"{result.code}: {result.message}"
-        except Exception:
-            err = str(e)
-        return jsonify({"error": err}), 500
-    except Exception as e:
-        return jsonify({"error": str(e), "detail": traceback.format_exc()}), 500
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "running", "message": "Import started..."}
 
-    return jsonify({
-        "success": True,
-        "sheet_name": project_name,
-        "activity_count": len(activities_flat),
-        "sheet_url": sheet_url,
-    })
+    def run():
+        try:
+            url = _push_to_smartsheet(api_key, project_name, parsed)
+            jobs[job_id] = {
+                "status": "done",
+                "sheet_name": project_name,
+                "activity_count": len(activities_flat),
+                "sheet_url": url,
+            }
+        except Exception as e:
+            jobs[job_id] = {"status": "error", "error": str(e), "detail": traceback.format_exc()}
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/status/<job_id>")
+def job_status(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Unknown job ID"}), 404
+    return jsonify(job)
 
 
 def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
