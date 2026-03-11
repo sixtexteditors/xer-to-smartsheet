@@ -42,7 +42,7 @@ def _with_retry(fn, max_attempts=6):
                 code = None
             # 1063 = invalid parentId (eventual consistency), 4003 = rate limit, 4004 = timeout
             if code in (1063, 4003, 4004) and attempt < max_attempts - 1:
-                wait = (2 ** attempt) + random.uniform(0, 1)
+                wait = min(2 ** attempt, 8) + random.uniform(0, 1)
                 time.sleep(wait)
             else:
                 raise
@@ -115,18 +115,15 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
 
     Flow:
       1. Find or create sheet
-      2. Insert WBS rows in parallel by depth
-      3. Insert all activities flat (no parent) in sequential batches
-      4. Pass 2a: update_rows to place each activity under its WBS parent
-      5. Pass 2b: fetch sheet for row numbers, update predecessor/dependent columns
+      2. Pass 1a: Insert WBS rows in parallel by depth
+      3. Pass 1b: Insert activities grouped by WBS parent (parallel, 2 workers)
+      4. Pass 2: fetch sheet for row numbers, update predecessor/dependent columns
 
-    Why flat insert + separate hierarchy pass:
-      add_rows requires all rows in one call to share the same parent_id.
-      With 800 unique WBS parents this meant 800 parallel calls, causing 1063
-      (invalid parentId) errors due to Smartsheet eventual consistency.
-      update_rows has the same parent_id restriction as add_rows, but since
-      activities are already in the sheet, 1063 (invalid parentId) errors
-      cannot occur — all referenced parent rows definitely exist.
+    add_rows requires all rows in one call to share the same parent_id, so
+    activities are grouped by WBS parent before insertion. 1063 errors
+    (invalid parentId due to Smartsheet eventual consistency) are handled by
+    _with_retry. A 3-second sleep between WBS and activity insertion reduces
+    the frequency of 1063 errors.
 
     Returns the permalink URL of the sheet.
     """
@@ -271,60 +268,52 @@ def _push_to_smartsheet(api_key: str, sheet_name: str, parsed: dict) -> str:
                 raise Exception(f"WBS insertion failed: {errors[0]}")
 
     # -------------------------------------------------------------------------
-    # PASS 1b: Insert all activities flat (no parent_id)
+    # PASS 1b: Insert activities grouped by WBS parent
     # Brief sleep first to let WBS rows fully commit on Smartsheet's side.
+    # add_rows requires all rows in one call to share the same parent_id, so
+    # group by parent. 1063 (invalid parentId) is retried by _with_retry.
     # -------------------------------------------------------------------------
     time.sleep(3)
 
     task_id_to_ss_row_id = {}
-    for i in range(0, len(activities_flat), batch_size):
-        batch = activities_flat[i:i + batch_size]
-        rows = [(act["_task_id"], _build_activity_row(act)) for act in batch]
-        _batch_rows = [r for _, r in rows]
-        result = _with_retry(lambda r=_batch_rows: ss.Sheets.add_rows(sheet_id, r))
-        returned = result.result if isinstance(result.result, list) else [result.result]
-        for (task_id, _), returned_row in zip(rows, returned):
-            task_id_to_ss_row_id[task_id] = returned_row.id
 
-    # -------------------------------------------------------------------------
-    # PASS 2a: Place each activity under its WBS parent via update_rows
-    # update_rows has the same restriction as add_rows: all rows in one call
-    # must share the same parent_id. Group by parent and parallelize.
-    # -------------------------------------------------------------------------
-    by_parent_update = defaultdict(list)
+    by_parent_ss = defaultdict(list)
     for act in activities_flat:
-        tid = act["_task_id"]
-        act_ss_row_id = task_id_to_ss_row_id.get(tid)
-        if act_ss_row_id is None:
-            continue
-        parent_ss_id = wbs_id_to_ss_row_id.get(act["_wbs_id"])
-        if parent_ss_id is None:
-            continue
-        update_row = smartsheet.models.Row()
-        update_row.id = act_ss_row_id
-        update_row.parent_id = parent_ss_id
-        by_parent_update[parent_ss_id].append(update_row)
+        by_parent_ss[wbs_id_to_ss_row_id.get(act["_wbs_id"])].append(act)
 
-    def _send_parent_group(parent_ss_id, rows):
+    def _insert_activity_group(parent_ss_id, acts):
         ss_local = smartsheet.Smartsheet(api_key)
         ss_local.errors_as_exceptions(True)
-        for i in range(0, len(rows), batch_size):
-            _batch = rows[i:i + batch_size]
-            _with_retry(lambda b=_batch: ss_local.Sheets.update_rows(sheet_id, b))
+        group_results = []
+        for i in range(0, len(acts), batch_size):
+            batch = acts[i:i + batch_size]
+            rows = []
+            for act in batch:
+                row = _build_activity_row(act)
+                if parent_ss_id:
+                    row.parent_id = parent_ss_id
+                rows.append((act["_task_id"], row))
+            _batch_rows = [r for _, r in rows]
+            result = _with_retry(lambda r=_batch_rows: ss_local.Sheets.add_rows(sheet_id, r))
+            returned = result.result if isinstance(result.result, list) else [result.result]
+            for (task_id, _), returned_row in zip(rows, returned):
+                group_results.append((task_id, returned_row.id))
+        return group_results
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {
-            executor.submit(_send_parent_group, pid, rows): pid
-            for pid, rows in by_parent_update.items()
+            executor.submit(_insert_activity_group, parent_ss_id, acts): parent_ss_id
+            for parent_ss_id, acts in by_parent_ss.items()
         }
         errors = []
         for future in as_completed(futures):
             try:
-                future.result()
+                for task_id, ss_row_id in future.result():
+                    task_id_to_ss_row_id[task_id] = ss_row_id
             except Exception as e:
                 errors.append(str(e))
         if errors:
-            raise Exception(f"Activity hierarchy placement failed: {errors[0]}")
+            raise Exception(f"Activity insertion failed: {errors[0]}")
 
     # -------------------------------------------------------------------------
     # PASS 2b: Update predecessor, predecessor names, dependent, dependent name columns
